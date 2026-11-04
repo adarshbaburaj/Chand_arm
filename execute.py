@@ -20,6 +20,14 @@ def _minjerk(s):
     return 10 * s**3 - 15 * s**4 + 6 * s**5
 
 
+GRIP_CLOSED = 0.0          # gripper.pos is 0-100 % of range; empty jaws close freely to ~0.9
+HOLD_LOAD, HOLD_CUR = 10.0, 6   # probe 01:50: holding a 30 mm cube -> load 15.6 %, current 11; empty -> 3-6 %, 0-2
+
+
+def pushback(load, cur):
+    return abs(load) > HOLD_LOAD or cur > HOLD_CUR
+
+
 class Mover:
     def __init__(self, follower, hold=None):
         self.f = follower
@@ -132,7 +140,7 @@ class Mover:
                 self._send(self.q + self.bias, close_cmd); time.sleep(1 / HZ)
             self.grip = close_cmd
         pos, load, cur = self.grip_sense()
-        held = contact is not None and pos > close_cmd + 2.0 and abs(load) > 3.0   # pushback = something in the jaws
+        held = contact is not None and pos > close_cmd + 2.0 and pushback(load, cur)   # something in the jaws
         res = dict(contact=contact, held=held, pos=round(pos, 1), load=load, cur=cur, cmd=round(self.grip, 1), trace=trace)
         if log is not None: log.append(res)
         return res
@@ -273,7 +281,7 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     out["grasps"] = []
     for k in range(MAX_GRASPS):
         step("close (force feedback)")
-        ff = mv.grasp_ff(g["close_cmd"])
+        ff = mv.grasp_ff(GRIP_CLOSED)
         out["grasps"].append({kk: ff[kk] for kk in ("contact", "held", "pos", "load")} | {"shift": plan.get("shift")})
         print(f"  grasp {k + 1}: contact {ff['contact']} pos {ff['pos']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", flush=True)
         if ff["held"] or k == MAX_GRASPS - 1:
@@ -292,9 +300,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     gm = ff["pos"]
     held = ff["held"]
     step("lift");     mv.follow(plan["lift"][1:], peak_deg_s=25)
-    pos, load, _ = mv.grip_sense()                     # still pushing back after lifting = did not slip out
-    out["lifted"] = {"pos": round(pos, 1), "load": load}
-    held = held and pos > g["close_cmd"] + 2.0
+    pos, load, cur = mv.grip_sense()                   # still pushing back after lifting = did not slip out
+    out["lifted"] = {"pos": round(pos, 1), "load": load, "cur": cur}
+    held = held and pos > GRIP_CLOSED + 2.0 and pushback(load, cur)
     print(f"  after lift: pos {pos:.1f} load {load} -> {'still holding' if held else 'empty'}", flush=True)
     if vis is not None:
         step("check hold"); h = vis.hold(held)
