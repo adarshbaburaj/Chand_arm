@@ -169,6 +169,7 @@ def main():
     ZONE = threading.Lock()
     scan_pose = None
     blacklist, history, log = [], [], []
+    pending_spot = []                               # objects the left arm put on the handoff spot
     reach_cache = {}
     info = {"mined": 0, "handed": 0, "t0": None, "last_seen": time.time(), "brain": "", "order": []}
 
@@ -216,12 +217,47 @@ def main():
         viz.text(f"{arm}: {result}", "INFO" if result in ("mined",) or result.startswith("handed") else "WARN")
 
     # ------------------------------------------------------------------ jobs (run in arm threads)
-    def right_pick(rock, frame):
+    def spot_rock(src):
+        """The object the left arm just put on the handoff spot: known position, no camera needed."""
+        x, y = two_arm.px_to_arm("right", *spot)
+        return {"id": f"{src.get('id', 'obj')}@spot", "u": int(spot[0]), "v": int(spot[1]), "x_mm": round(x), "y_mm": round(y),
+                "shape": src.get("shape"), "colour": "red"}
+
+    def spot_free():
+        f = cam.fresh("top"); objs, _ = perceive.detect(f)
+        return not any(np.hypot(o["u"] - spot[0], o["v"] - spot[1]) < 40 for o in objs)
+
+    def left_carry_to_spot(rock, status="hand over"):
+        """Left arm: pick `rock` (top-cam px) and put it on the handoff spot. Caller holds arms['left']['lock'].
+        Returns the pick_place result. Releases the shared-zone lock once the left arm is back at rest."""
+        mv = arms["left"]["mv"]; arms["left"]["job_name"] = status
+        step = make_step("left")
+        rt, _ = execute.memory_get(rock.get("shape", "_other"))
+        rt = (rt[0] + LEFT_EXTRA_DEPTH_MM, rt[1])     # left arm comes up short (user, selfcal 03:20): grasp deeper
+        xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
+        extra = {"shape": rock.get("shape"), "axis_px": rock.get("axis_px")}
+        vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL, **extra}, lambda: cam.fresh("left_wrist"),
+                              lambda d: None, arm="left") if JUDGE and "left_wrist" in cam.cams else None)
+        held_zone = {}
+        try:
+            res = two_arm.left_handoff(mv, (rock["u"], rock["v"]), skill, spot, step, vis=vis, shift_rt=rt,
+                                       zone=ZONE, spot_free=spot_free, held_zone=held_zone, extra=extra)
+        except ValueError as e:
+            res = {"held": False, "reason": f"cannot plan: {e}"}
+        finally:
+            if held_zone.get("yes"): ZONE.release()
+            arms["left"]["status"] = "idle (rest)"
+        return res
+
+    def right_attempt(rock, allow_assist=True, check_target=None):
+        """One right-arm pick of `rock` into the bin, ending above the bin (scan pose). If two grasps miss, the right
+        arm backs off a few cm, the LEFT arm (if free and in reach) carries the object to the handoff spot, and the
+        right arm picks it there straight away."""
         nonlocal scan_pose
-        mv = arms["right"]["mv"]; step = make_step("right")
-        if JUDGE:
+        mv = arms["right"]["mv"]; base_step = make_step("right")
+        if JUDGE and check_target is not None:
             try:
-                p = judge.is_target(frame, rock, rule["rule_text"])
+                p = judge.is_target(check_target, rock, rule["rule_text"])
                 if p < judge.SURE_NO:
                     blacklist.append((rock["x_mm"], rock["y_mm"])); record("right", rock, f"not a target (jev {p:.2f})"); return
             except Exception as e:
@@ -232,36 +268,41 @@ def main():
         except ValueError as e:
             blacklist.append((rock["x_mm"], rock["y_mm"])); record("right", rock, f"cannot plan: {e}"); return
         scan_pose = plan["above_bin"]
-        in_zone = overlap is not None and overlap[min(479, max(0, rock["v"])), min(639, max(0, rock["u"]))]
+        in_zone = overlap is not None and overlap[min(479, max(0, int(rock["v"]))), min(639, max(0, int(rock["u"])))]
         zone_held = {"yes": False}
-        def step(name, _s=step):
+        def step(name):
             if name == "approach" and in_zone and not zone_held["yes"]:
                 arms["right"]["status"] = "waiting for the shared area"
                 while not ZONE.acquire(timeout=0.3):
                     if st["quit"]: raise KeyboardInterrupt
                 zone_held["yes"] = True
-            if name in ("carry", "home") and zone_held["yes"]:
-                ZONE.release(); zone_held["yes"] = False
-            _s(name)
+            if (name in ("carry", "home") or name.startswith("waiting: LEFT")) and zone_held["yes"]:
+                ZONE.release(); zone_held["yes"] = False          # never hold the shared area while the left works
+            base_step(name)
         vis = execute.Vision(skill, calib, rock, lambda: cam.fresh("right_wrist"), lambda d: None, arm="right") if JUDGE else None
-        def push(plan_r):
-            if "left" not in arms or not arms["left"]["lock"].acquire(blocking=False):
-                return False                                 # left arm busy: no assist this time
+        def assist_left(plan_r):
+            if not allow_assist or "left" not in arms or spot is None:
+                return False
+            if not two_arm.can_pick("left", rock["u"], rock["v"], skill)[0]:
+                print("  assist: left arm can't reach this object", flush=True); return False
+            if not arms["left"]["lock"].acquire(timeout=0.5):
+                print("  assist: left arm busy", flush=True); return False
             try:
-                R2L, tzL = assist.frames()
-                pp = assist.plan_push((rock["x_mm"], rock["y_mm"]), plan_r["tip"], arms["left"]["mv"].q, R2L, tzL)
-                if pp["err"] > 6:
-                    return False
-                arms["left"]["status"] = "PUSHING object into the right gripper"
-                assist.do_push(arms["left"]["mv"], pp, arms["left"]["rest"]); return True
-            except Exception as e:
-                print("  push assist failed:", e, flush=True); return False
+                print("  ASSIST: right backed off, LEFT arm takes the object to the handoff spot", flush=True)
+                viz.text("assist: left arm takes the object to the handoff spot")
+                res_l = left_carry_to_spot(rock, "assist the right arm")
+                print(f"  assist: left {'put it on the handoff spot' if res_l.get('held') else 'missed too'}", flush=True)
+                return bool(res_l.get("held"))
             finally:
-                arms["left"]["status"] = "idle (rest)"; arms["left"]["lock"].release()
+                arms["left"]["lock"].release()
         try:
-            res = execute.pick_place(mv, plan, skill, step, vis=vis, assist=push, end_pose=scan_pose)
+            res = execute.pick_place(mv, plan, skill, step, vis=vis, assist=assist_left, end_pose=scan_pose)
         finally:
             if zone_held["yes"]: ZONE.release()
+        if res.get("reason") == "assisted":
+            record("right", rock, "handed to the left arm (assist)", res)
+            info["handed"] += 1
+            return right_attempt(spot_rock(rock), allow_assist=False)     # pick it at the spot right away
         ok = bool(res.get("held")) and (res.get("at_drop") or {}).get("held", False)
         if res.get("reason") != "object lost":
             execute.memory_put(rock.get("shape", "_other"), res.get("shift_rt", rt), ok)
@@ -269,27 +310,17 @@ def main():
         record("right", rock, "mined" if ok else (res.get("reason") or ("missed grasp" if not res.get("held") else "dropped on the way")), res)
         viz.value("mission/mined", info["mined"])
 
+    def right_pick(rock, frame):
+        right_attempt(rock, allow_assist=True, check_target=frame)
+
+    def right_pick_spot(src):
+        right_attempt(spot_rock(src), allow_assist=False)
+
     def left_handoff(rock, frame):
-        mv = arms["left"]["mv"]; step = make_step("left")
-        rt, _ = execute.memory_get(rock.get("shape", "_other"))
-        rt = (rt[0] + LEFT_EXTRA_DEPTH_MM, rt[1])     # left arm comes up short (user, selfcal 03:20): grasp deeper
-        xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
-        extra = {"shape": rock.get("shape"), "axis_px": rock.get("axis_px")}
-        vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL, **extra}, lambda: cam.fresh("left_wrist"),
-                              lambda d: None, arm="left") if JUDGE and "left_wrist" in cam.cams else None)
-        def spot_free():
-            f = cam.fresh("top"); objs, _ = perceive.detect(f)
-            return not any(np.hypot(o["u"] - spot[0], o["v"] - spot[1]) < 40 for o in objs)
-        held_zone = {}
-        try:
-            res = two_arm.left_handoff(mv, (rock["u"], rock["v"]), skill, spot, step, vis=vis, shift_rt=rt,
-                                       zone=ZONE, spot_free=spot_free, held_zone=held_zone, extra=extra)
-        except ValueError as e:
-            res = {"held": False, "reason": f"cannot plan: {e}"}
-        finally:
-            if held_zone.get("yes"): ZONE.release()
+        res = left_carry_to_spot(rock)
         if res.get("held"):
             info["handed"] += 1
+            pending_spot.append(rock)              # right arm: pick it at the spot as soon as it is free
         record("left", rock, "handed to the right arm" if res.get("held") else ("left: " + (res.get("reason") or "missed grasp")), res)
 
     def go_rest(arm):
@@ -342,7 +373,8 @@ def main():
                 time.sleep(0.05); continue
             frame = cam.fresh("top")
             rocks, _ = perceive.scene(frame, calib)
-            busy_tips = [_tip_px(n, getattr(a["mv"], "q_cmd", a["mv"].q)) for n, a in arms.items() if a["job"] is not None]
+            busy_tips = [_tip_px(n, getattr(a["mv"], "q_cmd", a["mv"].q)) for n, a in arms.items()
+                         if a["job"] is not None or a["lock"].locked()]          # (the left can be busy assisting)
             cand = []
             for r in rocks:
                 if any(np.hypot(r["u"] - t[0], r["v"] - t[1]) < CARRY_IGNORE_PX for t in busy_tips):
@@ -352,16 +384,22 @@ def main():
                 r["arm"] = reach(r)
                 if r["arm"] != "none":
                     cand.append(r)
-            if cand:
-                info["last_seen"] = time.time()
+            workable = [r for r in rocks if not near(r, blacklist)]   # red objects someone can still do something about
+            if workable or pending_spot or ("left" in arms and (arms["left"]["job"] is not None or arms["left"]["lock"].locked())):
+                info["last_seen"] = time.time()       # any red object left (even one being carried) = no rest
             if len(cand) > n_targets_seen and BACKEND != "rule":
                 ask_spark(cand)                 # new objects appeared: let Spark (re)order them in the background
             n_targets_seen = len(cand)
             right_t = [r for r in cand if r["arm"] == "right"]
             left_t = [r for r in cand if r["arm"] == "left"]
-            if arms["right"]["job"] is None and right_t:
+            if arms["right"]["job"] is None and pending_spot:
+                src = pending_spot.pop(0)
+                run_job("right", f"pick {src.get('id')} from the handoff spot", right_pick_spot, src)
+            elif arms["right"]["job"] is None and right_t:
                 at_spot = [r for r in right_t if spot is not None and np.hypot(r["u"] - spot[0], r["v"] - spot[1]) < 40]
                 pick = at_spot[0] if at_spot else None
+                if at_spot:
+                    pending_spot.clear()               # taking it now via the camera
                 if pick is None and _ORDER:
                     with _order_lock:
                         for pos in list(_ORDER):

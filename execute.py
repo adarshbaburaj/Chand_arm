@@ -56,8 +56,18 @@ class Mover:
         self.q = np.array([o[k] for k in J])
         self.grip = float(o["gripper.pos"])
 
+    def _obs(self):
+        """get_observation with retries: a single lost status packet on the serial bus must not kill a job."""
+        for i in range(4):
+            try:
+                return self.f.get_observation()
+            except (ConnectionError, RuntimeError) as e:
+                if i == 3:
+                    raise
+                time.sleep(0.01)
+
     def read(self):
-        o = self.f.get_observation()
+        o = self._obs()
         q = np.array([o[k] for k in J])
         viz.joints(self.name, q_meas=q)
         return q
@@ -65,7 +75,14 @@ class Mover:
     def _send(self, q, grip):
         self.q_cmd = np.asarray(q, float) - self.bias       # live commanded pose (other threads read it)
         viz.joints(self.name, q_cmd=q); viz.gripper(self.name, cmd=grip)
-        self.f.send_action({**{k: float(v) for k, v in zip(J, q)}, "gripper.pos": float(grip)})
+        act = {**{k: float(v) for k, v in zip(J, q)}, "gripper.pos": float(grip)}
+        for i in range(3):
+            try:
+                self.f.send_action(act); return
+            except (ConnectionError, RuntimeError):
+                if i == 2:
+                    raise
+                time.sleep(0.01)
 
     def move(self, q_to, grip=None, settle_s=0.8, tol=0.6):
         grip = self.grip if grip is None else grip
@@ -132,7 +149,10 @@ class Mover:
         raw, _, self.grip_err = ph.read2ByteTxRx(port, 6, 60)      # status flags (e.g. overload) must not crash us
         load = (raw & 0x3FF) / 10.0 * (-1 if raw & 0x400 else 1)
         cur, _, _ = ph.read2ByteTxRx(port, 6, 69)
-        pos = float(self.f.get_observation()["gripper.pos"]) if self.grip_err else float(b.read("Present_Position", "gripper"))
+        try:
+            pos = float(b.read("Present_Position", "gripper", num_retry=3)) if not self.grip_err else float(self._obs()["gripper.pos"])
+        except (ConnectionError, RuntimeError):
+            pos = float(self._obs()["gripper.pos"])
         viz.gripper(self.name, pos=pos, load=load, cur=cur)
         return pos, load, int(cur)
 
@@ -179,7 +199,7 @@ class Mover:
     def gripper(self, value, wait=0.6, deg_s=60.0):
         """Ramp the gripper to `value` while holding the arm. A single command is not enough:
         max_relative_target clips every command to 5 deg from the present position."""
-        start = float(self.f.get_observation()["gripper.pos"])
+        start = float(self._obs()["gripper.pos"])
         n = max(1, int(abs(value - start) / deg_s * HZ))
         for i in range(1, n + 1):
             self._send(self.q + self.bias, start + (value - start) * i / n)
@@ -189,7 +209,7 @@ class Mover:
             self._send(self.q + self.bias, value)
             time.sleep(1 / HZ)
         self.grip = value
-        return float(self.f.get_observation()["gripper.pos"])
+        return float(self._obs()["gripper.pos"])
 
 
 # ---------------------------------------------------------------- pick & place from the taught skill
@@ -386,15 +406,21 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
             plan = vis.replan(plan, a["dp"])
             mv.move(plan["q_pre"], grip=g_open)
             mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
-    # ---- force-feedback grasp with regrasp search: close until the jaw feels the object; if it closes on air,
-    # reopen, back straight up, shift the aim (camera-guided if possible, else a small search pattern), try again
-    # run 6: wrist cam showed the object just BEYOND the fingertips (arm stopped short) -> search deeper first
-    pattern = [(15.0, 0.0), (15.0, 0.0), (-30.0, 10.0), (0.0, -20.0)]   # (radial, tangential) mm, cumulative shifts
+    # ---- force-feedback grasp ladder (user, 03:35):
+    #   grasp 1 fails -> IMMEDIATELY grasp 2: jaws wider + slide 15 mm deeper at grasp height (no backing out)
+    #   grasp 2 fails -> back off a few cm and let the LEFT arm take the object to the handoff spot (assist);
+    #                    the caller then picks it there. No assist possible -> grasp 3: full retreat, Jev says
+    #                    which way (or a search pattern), widest jaws.
+    OPEN_STEPS = [g_open, 45.0, 58.0]        # gripper.pos 0-100 %
     tang = [(0.0, 10.0), (0.0, -20.0)]
-    OPEN_STEPS = [g_open, 45.0, 58.0]        # each retry opens the jaws wider (gripper.pos 0-100 %)
     out["grasps"] = []
+    backed_off = False
+
+    def replan(p, dp):
+        return vis.replan(p, dp) if vis is not None else plan_pick(p["rock"], skill, p["calib"], shift=_add_shift(p, dp))
+
     for k in range(MAX_GRASPS):
-        step("close (force feedback)")
+        step(f"close {k + 1} (force feedback)")
         ff = mv.grasp_ff(GRIP_CLOSED)
         out["grasps"].append({kk: ff[kk] for kk in ("contact", "held", "pos", "load")} | {"shift": plan.get("shift")})
         viz.text(f"grasp {k + 1}: contact {ff['contact']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}",
@@ -403,29 +429,45 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
         if ff["held"] or k == MAX_GRASPS - 1:
             break
         g_open = OPEN_STEPS[min(k + 1, len(OPEN_STEPS) - 1)]
-        step(f"regrasp {k + 2}: deeper + jaws wider ({g_open:.0f} %)"); mv.gripper(g_open, wait=0.3)
-        print(f"  regrasp {k + 2}: opening jaws to {g_open:.0f} %, going deeper", flush=True)
-        if assist is not None and not out.get("assisted"):
-            # two-arm: right gripper stays open at the grasp pose, the left arm slides the object into the jaws
-            step("left arm push"); out["assisted"] = bool(assist(plan))
-            if out["assisted"]:
-                continue                       # close again right here, no re-aim
-        dp = pattern[k % len(pattern)]
-        if vis is not None:            # look again at grasp height: which way is the object?
+        if k == 0:
+            # immediate second grasp: open wider right here, slide deeper along the table, close again
+            step(f"grasp 2 now: jaws {g_open:.0f} % + 15 mm deeper"); mv.gripper(g_open, wait=0.25)
+            new = replan(plan, (15.0, 0.0))
+            path, err = line(plan["tip"], new["tip"], mv.q, new["axis"], step_mm=5)
+            if err <= 6:
+                print(f"  grasp 2: jaws {g_open:.0f} %, sliding 15 mm deeper", flush=True)
+                mv.follow(path[1:], grip=g_open, peak_deg_s=15); mv.move(new["q_grasp"], grip=g_open, settle_s=0.6)
+                plan = new
+                continue
+            print(f"  grasp 2: cannot slide deeper in place (IK {err:.0f} mm) -> back out and re-approach", flush=True)
+            _retreat(mv, plan); plan = new
+            mv.move(plan["q_pre"], grip=g_open)
+            mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=0.8)
+            continue
+        # k == 1: two misses. Back off a few cm so the left arm has room, and ask it to help.
+        dp = tang[0]
+        if vis is not None:            # which way is the object? (photo taken at grasp height, before backing off)
             w = vis.where()
             out.setdefault("where", []).append(w)
-            if w.get("choice") == "none" and w["p"].get("none", 0) > 0.7:
-                print("  object no longer near the fingers (pushed away?) -> give up on this one", flush=True)
-                _retreat(mv, plan); mv.move(home, grip=g["close_cmd"] + 6)
-                out.update(held=False, grip=ff["pos"], reason="object lost"); return out
             if w["p"].get("beyond", 0) > 0.8:
-                dp = (12.0, 0.0)                      # deeper, accumulates with earlier shifts
+                dp = (12.0, 0.0)
             elif w.get("choice") in ("left", "right"):
-                dp = tang[k % 2]
-        _retreat(mv, plan)
-        plan = vis.replan(plan, dp) if vis is not None else plan_pick(plan["rock"], skill, plan["calib"], shift=_add_shift(plan, dp))
+                dp = tang[1] if w.get("choice") == "right" else tang[0]
+        step("backing off for the left arm"); _retreat(mv, plan); backed_off = True
+        T = kin.fk(mv.q); q_up, e = kin.ik(T[:3, 3] + [0, 0, 40.0], mv.q, down=False, axis=T[:3, 2])
+        if e < 5:
+            mv.move(q_up, settle_s=0.2)                   # ~6 cm back along the approach + 4 cm up
+        out["standby_q"] = mv.q.copy()
+        if assist is not None:
+            step("waiting: LEFT arm takes the object to the handoff spot")
+            if assist(plan):
+                out.update(held=False, grip=ff["pos"], reason="assisted", shift_rt=[0.0, 0.0])
+                return out                                # caller picks it at the handoff spot from here
+        # no assist: third grasp, widest jaws, full re-approach
+        step(f"grasp 3: jaws {g_open:.0f} %, re-aim {dp}")
+        plan = replan(plan, dp)
         mv.move(plan["q_pre"], grip=g_open)
-        mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
+        mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=0.8)
     gm = ff["pos"]
     held = ff["held"]
     step("lift");     mv.follow(plan["lift"][1:], peak_deg_s=25)
