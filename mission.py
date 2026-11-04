@@ -114,6 +114,7 @@ def main():
 
     follower = SOFollower(SOFollowerRobotConfig(port=FOLLOWER_PORT, id=ARM_ID, max_relative_target=5.0))
     follower.connect(calibrate=False)
+    print("gripper boost", execute.boost_gripper(follower), flush=True)
     mv = Mover(follower, hold)
     home = mv.q.copy()
     history, log = [], []

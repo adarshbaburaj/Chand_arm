@@ -24,6 +24,23 @@ GRIP_CLOSED = 0.0          # gripper.pos is 0-100 % of range; empty jaws close f
 HOLD_LOAD, HOLD_CUR = 10.0, 6   # probe 01:50: holding a 30 mm cube -> load 15.6 %, current 11; empty -> 3-6 %, 0-2
 
 
+# Gripper strength. LeRobot's SOFollower.configure() writes (on EVERY connect) gripper Max_Torque_Limit 500 (50 %),
+# Protection_Current 250, Overload_Torque 25 %. With Protection_Time 200 (~2 s) the servo trips "Overload" when it
+# squeezes harder than 25 % for ~1-2 s and drops to Protective_Torque 20 %. That is the "motor cuts out" the user saw.
+# We raise only the overload threshold + torque cap for the gripper, and keep the over-current and 70 °C
+# temperature protections. The hard squeeze lasts only while carrying (a few s); temperature is watched.
+GRIP_BOOST = {"Max_Torque_Limit": 800, "Torque_Limit": 800, "Overload_Torque": 80, "Protection_Time": 250}
+GRIP_HOT_C = 55          # above this, squeeze gently
+
+
+def boost_gripper(follower):
+    b = follower.bus
+    with b.torque_disabled("gripper"):
+        for k, v in GRIP_BOOST.items():
+            b.write(k, "gripper", v)
+    return {k: b.read(k, "gripper", normalize=False) for k in GRIP_BOOST}
+
+
 def pushback(load, cur):
     return abs(load) > HOLD_LOAD or cur > HOLD_CUR
 
@@ -105,13 +122,18 @@ class Mover:
         """Gripper (position deg, load %, current raw). STS3215 Present_Load: bit 10 = direction, low 10 bits =
         0..1000 (0.1 % of max torque). This is the 'force feedback': the jaw pushing against something."""
         b = self.f.bus
-        raw = int(b.read("Present_Load", "gripper", normalize=False))
+        ph, port = b.packet_handler, b.port_handler
+        raw, _, self.grip_err = ph.read2ByteTxRx(port, 6, 60)      # status flags (e.g. overload) must not crash us
         load = (raw & 0x3FF) / 10.0 * (-1 if raw & 0x400 else 1)
-        cur = int(b.read("Present_Current", "gripper", normalize=False))
-        pos = float(b.read("Present_Position", "gripper"))
-        return pos, load, cur
+        cur, _, _ = ph.read2ByteTxRx(port, 6, 69)
+        pos = float(self.f.get_observation()["gripper.pos"]) if self.grip_err else float(b.read("Present_Position", "gripper"))
+        return pos, load, int(cur)
 
-    def grasp_ff(self, close_cmd, deg_s=20.0, lag_deg=2.0, load_pct=None, squeeze=2.5, log=None):
+    def grip_temp(self):
+        v, _, _ = self.f.bus.packet_handler.read1ByteTxRx(self.f.bus.port_handler, 6, 63)
+        return int(v)
+
+    def grasp_ff(self, close_cmd, deg_s=20.0, lag_deg=2.0, load_pct=None, squeeze=8.0, log=None):
         """Force-feedback close: close slowly; contact = the jaw stops following the command (lag) or the
         load rises. On contact, command only `squeeze` deg past the contact point (gentle, no squirting the
         object out), then check the pushback. Returns dict(contact, held, pos, load, trace)."""
@@ -130,6 +152,8 @@ class Mover:
                 contact = pos
                 break
         if contact is not None:
+            if self.grip_temp() > GRIP_HOT_C:
+                squeeze = min(squeeze, 3.0)
             target = max(close_cmd, contact - squeeze)
             for _ in range(int(0.6 * HZ)):
                 self._send(self.q + self.bias, target)
