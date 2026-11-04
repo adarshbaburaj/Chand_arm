@@ -54,14 +54,23 @@ def in_work_area(u, v):
         _WA = json.load(open(f)) if os.path.exists(f) else {}
     if not _WA:
         return True
-    (a, b), (c, d), m = _WA["top_line"], _WA["bottom_line"], _WA.get("inset_px", 6)
+    m = _WA.get("inset_px", 6)
+    if "poly" in _WA:                                   # tape rectangle corners (current camera)
+        return cv2.pointPolygonTest(np.array(_WA["poly"], np.float32), (float(u), float(v)), True) > m
+    (a, b), (c, d) = _WA["top_line"], _WA["bottom_line"]
     return a * u + b + m < v < c * u + d - m
+
+
+def bin_roi():
+    """Bin box (x0, y0, x1, y1) in top-cam px: from work_area.json if set, else the old fixed BIN_ROI."""
+    in_work_area(0, 0)
+    return tuple(_WA["bin_box"]) if _WA and "bin_box" in _WA else BIN_ROI
 
 
 def detect(img):
     objs = []
     cnts, _ = cv2.findContours(red_mask(img), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    x0, y0, x1, y1 = BIN_ROI
+    x0, y0, x1, y1 = bin_roi()
     bin_box = (x0, y0, x1 - x0, y1 - y0)
     for c in sorted(cnts, key=cv2.contourArea, reverse=True):
         a = cv2.contourArea(c)

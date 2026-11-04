@@ -1,0 +1,12 @@
+{
+ "top_line": [
+  -0.09241,
+  105.8
+ ],
+ "bottom_line": [
+  -0.08871,
+  469.9
+ ],
+ "inset_px": 6,
+ "note": "objects count only if strictly between the two black tape lines (top camera px). Fitted 2026-11-05 02:30 from snapshots/top_lines.jpg"
+}

@@ -67,7 +67,8 @@ def handoff_spot(skill):
         for v in range(20, 460, 15):
             if both is not None and not both[v, u]:
                 continue
-            if perceive.BIN_ROI[0] <= u <= perceive.BIN_ROI[2] and perceive.BIN_ROI[1] <= v <= perceive.BIN_ROI[3]:
+            b = perceive.bin_roi()
+            if b[0] <= u <= b[2] and b[1] <= v <= b[3]:
                 continue
             cands.append((np.hypot(u - best_u, v - best_v), u, v))
     for _, u, v in sorted(cands):

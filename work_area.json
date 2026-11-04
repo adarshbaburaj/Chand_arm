@@ -1,12 +1,28 @@
 {
- "top_line": [
-  -0.09241,
-  105.8
- ],
- "bottom_line": [
-  -0.08871,
-  469.9
+ "poly": [
+  [
+   68,
+   192
+  ],
+  [
+   556,
+   165
+  ],
+  [
+   612,
+   425
+  ],
+  [
+   28,
+   440
+  ]
  ],
  "inset_px": 6,
- "note": "objects count only if strictly between the two black tape lines (top camera px). Fitted 2026-11-05 02:30 from snapshots/top_lines.jpg"
+ "bin_box": [
+  440,
+  125,
+  580,
+  262
+ ],
+ "note": "camera raised 2026-11-05 03:00: inner corners of the black tape rectangle (top cam px) + bin box. Old view: work_area_oldcam.json"
 }

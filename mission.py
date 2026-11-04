@@ -121,6 +121,7 @@ def plan_next(rule, rocks, history):
 import threading  # noqa: E402
 
 IDLE_REST_S = 5.0
+LEFT_EXTRA_DEPTH_MM = 10.0
 CARRY_IGNORE_PX = 80
 _order_lock = threading.Lock()
 
@@ -271,6 +272,7 @@ def main():
     def left_handoff(rock, frame):
         mv = arms["left"]["mv"]; step = make_step("left")
         rt, _ = execute.memory_get(rock.get("shape", "_other"))
+        rt = (rt[0] + LEFT_EXTRA_DEPTH_MM, rt[1])     # left arm comes up short (user, selfcal 03:20): grasp deeper
         xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
         extra = {"shape": rock.get("shape"), "axis_px": rock.get("axis_px")}
         vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL, **extra}, lambda: cam.fresh("left_wrist"),
