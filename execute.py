@@ -254,11 +254,12 @@ def _mem_path():
     return Path(__file__).with_name("grasp_memory.json")
 
 
-def memory_get(shape):
+def memory_get(shape, arm="right"):
     import json
     m = json.loads(_mem_path().read_text()) if _mem_path().exists() else {}
-    if shape in m:
-        return tuple(m[shape]["rt"]), "memory"
+    key = shape if arm == "right" else f"{arm}:{shape}"
+    if key in m:
+        return tuple(m[key]["rt"]), "memory"
     return DEFAULT_RT.get(shape, DEFAULT_RT["_other"]), "default"
 
 
@@ -266,16 +267,17 @@ import threading as _threading  # noqa: E402
 _mem_lock = _threading.Lock()
 
 
-def memory_put(shape, rt, ok):
+def memory_put(shape, rt, ok, arm="right"):
     with _mem_lock:
-        _memory_put(shape, rt, ok)
+        _memory_put(shape if arm == "right" else f"{arm}:{shape}", rt, ok)
 
 
 def _memory_put(shape, rt, ok):
     """Successful offsets pull the memory toward them (EMA 0.5); failures are only counted."""
     import json
     m = json.loads(_mem_path().read_text()) if _mem_path().exists() else {}
-    e = m.setdefault(shape, {"rt": list(DEFAULT_RT.get(shape, DEFAULT_RT["_other"])), "ok": 0, "fail": 0})
+    base = shape.split(":")[-1]
+    e = m.setdefault(shape, {"rt": list(DEFAULT_RT.get(base, DEFAULT_RT["_other"])), "ok": 0, "fail": 0})
     if ok:
         e["rt"] = [round(0.5 * a + 0.5 * b, 1) for a, b in zip(e["rt"], rt)]
         e["ok"] += 1
@@ -386,26 +388,32 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
     home = mv.q.copy() if end_pose is None else np.asarray(end_pose, float)   # where to finish (rest or scan pose)
     out = {"aim": []}
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
-    if vis is not None and vis.jac is None and not Vision.calib_failed.get(vis.arm):
-        step("calibrate wrist cam (first time only)"); vis.calibrate(mv, plan)
-        Vision.calib_failed[vis.arm] = vis.jac is None     # don't waste ~6 s per pick retrying
+    # (the wrist-camera jacobian self-calibration is no longer needed: depth/side come from Jev's 'where' choice)
     step("descend");  mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
     if vis is not None:
+        # look before closing (wrist camera, Jev choice): object BEYOND the fingertips -> slide 15 mm deeper in place,
+        # off to one side -> slide 10 mm sideways; up to 3 corrections. (run 13: left arm closed on air with the
+        # object a full width beyond the tips.) Good grasps score 'beyond' ~0.6, real misses 0.84-0.97.
         for k in range(3):
-            step("check aim"); a = vis.aim()
-            out["aim"].append({k2: a[k2] for k2 in ("between", "c", "w", "dp") if k2 in a})
-            if a["ok"]:
+            step("check depth (wrist camera)")
+            w = vis.where()
+            out["aim"].append({"where": w.get("choice"), "p": {kk: round(v, 2) for kk, v in (w.get("p") or {}).items()}})
+            pb = (w.get("p") or {}).get("beyond", 0)
+            if pb > 0.8:
+                dp = (15.0, 0.0)
+            elif w.get("choice") == "none" and (w.get("p") or {}).get("none", 0) > 0.8:
+                print("  no object near the fingers: skip close", flush=True)
+                _retreat(mv, plan); mv.move(home, grip=g["close_cmd"] + 6)
+                out.update(held=False, grip=None, reason="object not at the fingers"); return out
+            else:
                 break
-            if a.get("dp") is None or k == 2:
-                if a["between"] < 0.3:   # sure it's not between the fingers: closing would only push it away
-                    print("  aim: object not between the fingers -> skip close (no push)", flush=True)
-                    _retreat(mv, plan); mv.gripper(g["close_cmd"] + 6, wait=0.2)
-                    mv.move(home); out.update(held=False, grip=None, reason="misaligned"); return out
-                break                    # unsure: try the grasp anyway
-            step("re-aim"); _retreat(mv, plan)
-            plan = vis.replan(plan, a["dp"])
-            mv.move(plan["q_pre"], grip=g_open)
-            mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
+            new = vis.replan(plan, dp)
+            path, err = line(plan["tip"], new["tip"], mv.q, new["axis"], step_mm=5)
+            if err > 6:
+                break
+            print(f"  aim: object beyond the fingertips (p {pb:.2f}) -> sliding {dp[0]:.0f} mm deeper before closing", flush=True)
+            mv.follow(path[1:], grip=g_open, peak_deg_s=15); mv.move(new["q_grasp"], grip=g_open, settle_s=0.5)
+            plan = new
     # ---- force-feedback grasp ladder (user, 03:35):
     #   grasp 1 fails -> IMMEDIATELY grasp 2: jaws wider + slide 15 mm deeper at grasp height (no backing out)
     #   grasp 2 fails -> back off a few cm and let the LEFT arm take the object to the handoff spot (assist);

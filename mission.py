@@ -30,7 +30,7 @@ if "--offline" in ARGS:
     socket.socket.connect = _guard
 
 import cv2
-import kin, perceive, brain, execute, judge, cams, viz, two_arm, assist
+import kin, perceive, brain, execute, judge, cams, viz, two_arm, assist, cost
 from execute import Mover
 
 FOLLOWER_PORT, ARM_ID = "/dev/ttyFollowerLeft", "thumbi_right"
@@ -121,7 +121,7 @@ def plan_next(rule, rocks, history):
 import threading  # noqa: E402
 
 IDLE_REST_S = 5.0
-LEFT_EXTRA_DEPTH_MM = 18.0   # run 12: Jev said "beyond" on every left miss
+LEFT_EXTRA_DEPTH_MM = 30.0   # runs 12-13: left wrist cam showed the object a full width beyond the tips
 HOME_WATCH_WRIST_FLEX = 20.0      # deg: wrist camera looks out over the table (tool axis ~13° below horizontal)
 CARRY_IGNORE_PX = 80
 _order_lock = threading.Lock()
@@ -138,7 +138,7 @@ def main():
     skill = json.load(open(HERE / "skill.json")); rule = skill["rule"]
     calib = perceive.load_calib()
     root = tk.Tk(); root.title("chand mission (two arms)")
-    lab = tk.Label(root, font=("Sans", 14), width=80, height=9, justify="left"); lab.pack()
+    lab = tk.Label(root, font=("Sans", 14), width=90, height=10, justify="left"); lab.pack()
     st = {"pause": True, "quit": False}
     def key(e):
         if e.char == " ": st["pause"] = not st["pause"]
@@ -184,7 +184,9 @@ def main():
         lines = [f"CHAND two-arm  {'PAUSED (SPACE)' if st['pause'] else 'running'}   mined {info['mined']}   handed over {info['handed']}   t {el:5.1f}s"]
         for n, a in arms.items():
             lines.append(f"{n.upper():5s}: {a['status']}")
-        lines += [f"brain: {info['brain']}", extra, "SPACE pause   Q stop (arms go home)"]
+        if info["t0"] is not None and time.time() - info.get("cost_t", 0) > 2:    # live AI cost of this run
+            info["cost_t"] = time.time(); info["cost"] = cost.fmt(cost.since(info["t0"]))
+        lines += [f"brain: {info['brain']}", f"cost so far: {info.get('cost', '$0')}", extra, "SPACE pause   Q stop (arms go home)"]
         try:
             lab.configure(text="\n".join(lines)); root.update()
         except tk.TclError:
@@ -238,8 +240,9 @@ def main():
         Returns the pick_place result. Releases the shared-zone lock once the left arm is back at rest."""
         mv = arms["left"]["mv"]; arms["left"]["job_name"] = status
         step = make_step("left")
-        rt, _ = execute.memory_get(rock.get("shape", "_other"))
-        rt = (rt[0] + LEFT_EXTRA_DEPTH_MM, rt[1])     # left arm comes up short (user, selfcal 03:20): grasp deeper
+        rt, rt_src = execute.memory_get(rock.get("shape", "_other"), arm="left")
+        if rt_src == "default":
+            rt = (rt[0] + LEFT_EXTRA_DEPTH_MM, rt[1])  # left arm comes up short (selfcal, runs 12-13): start deeper
         xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
         extra = {"shape": rock.get("shape"), "axis_px": rock.get("axis_px")}
         vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL, **extra}, lambda: cam.fresh("left_wrist"),
@@ -253,6 +256,8 @@ def main():
         finally:
             if held_zone.get("yes"): ZONE.release()
             arms["left"]["status"] = "idle (rest)"
+        if res.get("shift_rt") is not None and res.get("reason") is None:
+            execute.memory_put(rock.get("shape", "_other"), res["shift_rt"], bool(res.get("held")), arm="left")
         return res
 
     def right_attempt(rock, allow_assist=True, check_target=None):
@@ -434,8 +439,12 @@ def main():
                     st["pause"] = False; a["mv"].hold = None; a["mv"].move(a["rest"])
             except Exception as e:
                 print(f"{n} final rest move failed: {e}", flush=True)
-        json.dump(log, open(HERE / "logs" / time.strftime("mission_%H%M%S.json"), "w"), indent=1)
+        c = cost.since(info["t0"] or time.time())
+        json.dump({"picks": log, "mined": info["mined"], "handed": info["handed"],
+                   "cost": {"usd": round(c["usd"], 5), "calls": c["calls"], "by_model": c["by_model"], "text": cost.fmt(c)}},
+                  open(HERE / "logs" / time.strftime("mission_%H%M%S.json"), "w"), indent=1)
         print(f"MISSION END: mined {info['mined']}, handed over {info['handed']} in {time.time() - (info['t0'] or time.time()):.0f}s", flush=True)
+        print(f"RUN COST: {cost.fmt(c)}" + (f"  = ${c['usd'] / info['mined']:.4f} per mined object" if info["mined"] else ""), flush=True)
         try: root.destroy()
         except Exception: pass
         for a in arms.values():
