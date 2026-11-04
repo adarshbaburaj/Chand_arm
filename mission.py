@@ -109,195 +109,292 @@ def plan_next(rule, rocks, history):
     return {"skill": "pick", "obj": r["id"], "why": "fallback: nearest"}, "rule-fallback"
 
 
+# ============================================================================ parallel two-arm mission
+# Main thread: Tk window + DISPATCHER (look -> who is free -> give it a job), ~4 looks per second.
+# Each arm runs its job in its own thread (separate serial buses, so they really move at the same time).
+#   right arm: picks objects it can reach straight into the bin; after a drop it stays ABOVE THE BIN (scan pose) and
+#              the camera looks from there; only when nothing is left inside the black lines for IDLE_REST_S does it
+#              go to rest (so the camera sees the whole table) and keeps watching.
+#   left arm : picks objects ONLY it can reach and puts them on the handoff spot next to the right arm.
+# Shared area (both reach maps overlap): one arm at a time (ZONE lock).
+# A red blob near a busy arm's gripper (an object being carried) is never taken as a new target.
+import threading  # noqa: E402
+
+IDLE_REST_S = 5.0
+CARRY_IGNORE_PX = 80
+_order_lock = threading.Lock()
+
+
+def _tip_px(arm, q):
+    t = kin.fk_xyz(q)
+    return two_arm.arm_to_px(arm, t[0], t[1])
+
+
 def main():
     import tkinter as tk
     from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
     skill = json.load(open(HERE / "skill.json")); rule = skill["rule"]
     calib = perceive.load_calib()
-    root = tk.Tk(); root.title("chand mission")
-    lab = tk.Label(root, font=("Sans", 15), width=72, height=7, justify="left"); lab.pack()
-    st = {"pause": True, "quit": False, "step_wait": False}
+    root = tk.Tk(); root.title("chand mission (two arms)")
+    lab = tk.Label(root, font=("Sans", 14), width=80, height=9, justify="left"); lab.pack()
+    st = {"pause": True, "quit": False}
     def key(e):
-        if e.char == " ":
-            if st["step_wait"]: st["step_wait"] = False
-            else: st["pause"] = not st["pause"]
-        if e.char and e.char.lower() == "q": st["quit"] = True; st["pause"] = False; st["step_wait"] = False
+        if e.char == " ": st["pause"] = not st["pause"]
+        if e.char and e.char.lower() == "q": st["quit"] = True; st["pause"] = False
     root.bind("<Key>", key)
-    def on_close():  # window X = abort (go home), never destroy the window under the running loop
-        st["quit"] = True; st["pause"] = False; st["step_wait"] = False
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    info = {"mined": 0, "t0": None, "phase": "", "target": "", "brain": "", "judge": ""}
-    def show(extra=""):
-        try:
-            _show(extra)
-        except tk.TclError:  # window gone: keep the robot logic alive
-            st["pause"] = False
-    def _show(extra=""):
-        el = 0 if info["t0"] is None else time.time() - info["t0"]
-        lab.configure(text=f"CHAND  {'PAUSED (SPACE)' if st['pause'] else 'running'}   mined {info['mined']}   t {el:5.1f}s\n"
-                           f"target {info['target']}   phase {info['phase']}\nbrain {info['brain']}\njev {info['judge']}\n{extra}")
-        root.update()
-    def hold():
-        show(); return st["pause"]
-    def step(name):
-        if st["quit"]:
-            raise KeyboardInterrupt("aborted by user")
-        info["phase"] = name
-        if STEP and not st["quit"]:
-            st["step_wait"] = True
-            while st["step_wait"]:
-                show(f"STEP MODE: SPACE to do '{name}'"); time.sleep(0.05)
-        show()
+    root.protocol("WM_DELETE_WINDOW", lambda: (st.update(quit=True, pause=False)))
 
     if "--no-viz" not in ARGS:
-        viz.start()                       # viewer first (see viz.start)
-    cam = cams.Cams.start()
+        viz.start()
+    cam = cams.Cams.start(); viz.stream(cam)
     print("cameras on:", list(cam.cams), flush=True)
-    viz.stream(cam)
-    follower = SOFollower(SOFollowerRobotConfig(port=FOLLOWER_PORT, id=ARM_ID, max_relative_target=5.0))
-    follower.connect(calibrate=False)
-    print("gripper boost", execute.boost_gripper(follower), flush=True)
-    mv = Mover(follower, hold)
-    home = mv.q.copy()
-    mvL, homeL, spot = None, None, None
+    fR = SOFollower(SOFollowerRobotConfig(port=FOLLOWER_PORT, id=ARM_ID, max_relative_target=5.0)); fR.connect(calibrate=False)
+    execute.boost_gripper(fR)
+    hold = lambda: st["pause"]                       # workers never touch Tk
+    arms = {"right": {"mv": Mover(fR, hold, name="right")}}
+    arms["right"]["rest"] = arms["right"]["mv"].q.copy()
     if TWO_ARM:
         try:
-            fL = SOFollower(SOFollowerRobotConfig(port=two_arm.LEFT_PORT, id=two_arm.LEFT_ID, max_relative_target=5.0))
-            fL.connect(calibrate=False)
+            fL = SOFollower(SOFollowerRobotConfig(port=two_arm.LEFT_PORT, id=two_arm.LEFT_ID, max_relative_target=5.0)); fL.connect(calibrate=False)
             execute.boost_gripper(fL)
-            mvL = Mover(fL, hold, name="left"); homeL = mvL.q.copy()
-            spot = two_arm.handoff_spot(skill)
-            R2L, tzL = assist.frames()
-            print(f"two-arm mode: left follower on, handoff spot px {spot}", flush=True); viz.text(f"two-arm mode, handoff spot {spot}")
+            arms["left"] = {"mv": Mover(fL, hold, name="left")}; arms["left"]["rest"] = arms["left"]["mv"].q.copy()
         except Exception as e:
-            print("two-arm mode OFF:", e, flush=True); mvL = None
-    history, log = [], []
-    show("SPACE to start the mission")
-    while st["pause"] and not st["quit"]:
-        show("SPACE to start the mission"); time.sleep(0.05)
-    info["t0"] = time.time()
-    try:
-        for n in range(MAX_PICKS):
-            if st["quit"]: break
-            info["phase"] = "look"; show()
-            frame = perceive.grab()                     # arm is home = out of view
-            rocks, _ = perceive.scene(frame, calib)
-            drawn = perceive.draw(frame, *perceive.detect(frame))
-            cv2.imwrite(str(HERE / "snapshots" / f"mission_{n}.jpg"), drawn); viz.image("ai/top_detections", drawn)
-            for r in rocks:     # who can reach it (painted workspace + a real grasp plan)
-                if two_arm.can_pick("right", r["u"], r["v"], skill)[0]:
-                    r["arm"] = "right"
-                elif mvL is not None and two_arm.can_pick("left", r["u"], r["v"], skill)[0]:
-                    r["arm"] = "left"
-                else:
-                    r["arm"] = "none"
-            for r in [r for r in rocks if r["arm"] == "none"]:
-                if not any(h["result"] == "unreachable by both arms" and np.hypot(h["at"][0] - r["x_mm"], h["at"][1] - r["y_mm"]) < 30 for h in history):
-                    history.append({"obj": r["id"], "at": [r["x_mm"], r["y_mm"]], "result": "unreachable by both arms"})
-                    print(f"  {r['id']} at {r['x_mm'], r['y_mm']} mm: no arm can reach it", flush=True)
-            rocks = [r for r in rocks if r["arm"] != "none"]
-            info["phase"] = "think"; show()
-            d, src = plan_next(rule, rocks, history)
-            info["brain"] = f"{src}: {json.dumps(d)}"
-            print(f"[{n}] {len(rocks)} red seen -> {src}: {d}", flush=True); viz.text(f"[{n}] brain {src}: {d}")
-            if d["skill"] == "done":
-                break
-            rock = next(r for r in rocks if r["id"] == d["obj"])
-            info["target"] = f'{rock["id"]} {rock.get("shape")} ({rock["x_mm"]},{rock["y_mm"]}) mm -> {rock["arm"]} arm'
-            if JUDGE:
-                try:
-                    p = judge.is_target(frame, rock, rule["rule_text"])
-                    info["judge"] = f"target? {p:.2f}"; show()
-                    print(f"  jev: is target {p:.2f}", flush=True)
-                    if p < judge.SURE_NO:
-                        history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": f"not a target (jev {p:.2f})"})
-                        continue
-                except Exception as e:
-                    print("  jev target check failed (ignored):", e, flush=True)
-            rt, rt_src = execute.memory_get(rock.get("shape", "_other"))
-            print(f"  shape {rock.get('shape')} -> start offset {rt} mm (radial, tangential) from {rt_src}", flush=True)
-            if rock["arm"] == "left":
-                print(f"  right arm can't reach it: LEFT arm picks it and puts it at the handoff spot {spot}", flush=True)
-                viz.text(f"{rock['id']}: left arm hands it over to the right arm")
-                try:
-                    xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
-                    visL = None
-                    if JUDGE:
-                        visL = execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL}, lambda: cam.fresh("left_wrist"),
-                                              lambda d: None) if "left_wrist" in cam.cams else None
-                    res = two_arm.left_handoff(mvL, (rock["u"], rock["v"]), skill, spot, step, vis=visL, shift_rt=rt)
-                except KeyboardInterrupt:
-                    print("  aborted: left arm opening + home", flush=True)
-                    mvL.gripper(skill["gripper"]["open"] + 8, wait=0.3); mvL.move(homeL); break
-                except ValueError as e:
-                    res = {"held": False, "reason": f"left cannot plan: {e}"}
-                result = "handed to the right arm" if res.get("held") else ("left: " + (res.get("reason") or "missed grasp"))
-                history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": result})
-                log.append({"n": n, "rock": rock, "arm": "left", "result": result, "grasps": res.get("grasps"), "t": round(time.time() - info["t0"], 1)})
-                print(f"  -> {result}", flush=True); viz.text(f"-> {result}")
-                continue
-            try:
-                plan = execute.plan_pick(rock, skill, calib, shift=execute.rt_to_world(rt, np.arctan2(rock["y_mm"], rock["x_mm"])))
-            except ValueError as e:
-                print("  cannot plan:", e, flush=True); history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": f"unreachable: {e}"}); continue
-            try:
-                vis = None
-                if JUDGE:
-                    def on_look(d):
-                        if "held" in d: info["judge"] = f"held? {d['held']['held']} ({d['held']['src']}, p {d['held']['p']:.2f})"
-                        else: info["judge"] = f"aim: between {d['between']:.2f}  box {np.round(d.get('c', (0, 0)), 2).tolist()}  {d['s']} s"
-                        show()
-                    vis = execute.Vision(skill, calib, rock, lambda: perceive.grab(execute.WRIST_CAM, warm=8), on_look)
-                push = None
-                if mvL is not None:
-                    def push(plan_r, rock=rock):
-                        try:
-                            pp = assist.plan_push((rock["x_mm"], rock["y_mm"]), plan_r["tip"], mvL.q, R2L, tzL)
-                        except Exception as e:
-                            print("  left push: cannot plan:", e, flush=True); return False
-                        if pp["err"] > 6:
-                            print(f"  left push: out of reach (IK err {pp['err']} mm)", flush=True); return False
-                        print(f"  LEFT ARM PUSH: {pp['push_mm']} mm toward the right gripper", flush=True); viz.text("left arm pushes object into right gripper")
-                        assist.do_push(mvL, pp, homeL); return True
-                res = execute.pick_place(mv, plan, skill, step, vis=vis, assist=push)
-            except KeyboardInterrupt:
-                print("  aborted: opening gripper, going home", flush=True)
-                mv.gripper(skill["gripper"]["open"] + 8, wait=0.3)
-                if np.abs(mv.q - home).max() > 10:      # away from home: shoulder up a bit before swinging home
-                    lift = mv.q.copy(); lift[1] = max(lift[1] - 15, home[1])   # never past the home (limit) value
-                    mv.move(lift)
-                break
-            # verify placement with a fresh look (arm is home again)
-            after, _ = perceive.scene(perceive.grab(), calib)
-            still = any(np.hypot(r["x_mm"] - rock["x_mm"], r["y_mm"] - rock["y_mm"]) < 25 for r in after)
-            ok = res["held"] and not still
-            if res.get("reason") != "object lost":
-                execute.memory_put(rock.get("shape", "_other"), res.get("shift_rt", rt), ok)
-            info["mined"] += int(ok)
-            result = "mined" if ok else (res.get("reason") or ("missed grasp" if not res["held"] else "rock still on table"))
-            history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": result})
-            log.append({"n": n, "rock": rock, "brain": d, "src": src, "held": res["held"], "grip": res["grip"], "result": result,
-                        "aim": res.get("aim"), "hold": res.get("hold"), "grasps": res.get("grasps"), "lifted": res.get("lifted"),
-                        "t": round(time.time() - info["t0"], 1)})
-            print(f"  -> {result}", flush=True); viz.text(f"-> {result}", "INFO" if ok else "WARN"); viz.value("mission/mined", info["mined"])
-    finally:
-        info["phase"] = "home"; show()
+            print("left arm OFF:", e, flush=True)
+    for a in arms.values():
+        a.update(job=None, status="idle (rest)", at_rest=True, lock=threading.Lock())
+    spot = two_arm.handoff_spot(skill) if "left" in arms else None
+    mR, mL = two_arm.mask("right"), two_arm.mask("left")
+    overlap = (mR > 0) & (mL > 0) if mR is not None and mL is not None else None
+    ZONE = threading.Lock()
+    scan_pose = None
+    blacklist, history, log = [], [], []
+    reach_cache = {}
+    info = {"mined": 0, "handed": 0, "t0": None, "last_seen": time.time(), "brain": "", "order": []}
+
+    def ui(extra=""):
+        el = 0 if info["t0"] is None else time.time() - info["t0"]
+        lines = [f"CHAND two-arm  {'PAUSED (SPACE)' if st['pause'] else 'running'}   mined {info['mined']}   handed over {info['handed']}   t {el:5.1f}s"]
+        for n, a in arms.items():
+            lines.append(f"{n.upper():5s}: {a['status']}")
+        lines += [f"brain: {info['brain']}", extra, "SPACE pause   Q stop (arms go home)"]
         try:
-            if np.abs(mv.read() - home).max() > 3:
-                st["pause"] = False; mv.move(home)
+            lab.configure(text="\n".join(lines)); root.update()
+        except tk.TclError:
+            st["quit"] = True
+
+    def make_step(arm):
+        def step(name):
+            if st["quit"]:
+                raise KeyboardInterrupt("stopped by user")
+            arms[arm]["status"] = f"{arms[arm]['job_name']}: {name}"
+            viz.text(f"{arm}: {name}")
+        return step
+
+    def reach(r):
+        k = (r["u"] // 8, r["v"] // 8)
+        if k not in reach_cache:
+            if two_arm.can_pick("right", r["u"], r["v"], skill)[0]:
+                reach_cache[k] = "right"
+            elif "left" in arms and two_arm.can_pick("left", r["u"], r["v"], skill)[0]:
+                reach_cache[k] = "left"
+            else:
+                reach_cache[k] = "none"
+        return reach_cache[k]
+
+    def near(r, pts_mm, mm=30):
+        return any(np.hypot(r["x_mm"] - p[0], r["y_mm"] - p[1]) < mm for p in pts_mm)
+
+    def record(arm, rock, result, res=None):
+        history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": result})
+        if result != "mined" and not result.startswith("handed") and _fails(rock, history) >= 2:
+            blacklist.append((rock["x_mm"], rock["y_mm"]))
+        log.append({"arm": arm, "rock": {k: rock.get(k) for k in ("id", "shape", "x_mm", "y_mm", "u", "v")}, "result": result,
+                    "grasps": (res or {}).get("grasps"), "at_drop": (res or {}).get("at_drop"),
+                    "t": round(time.time() - info["t0"], 1)})
+        print(f"  [{arm}] {rock['id']} {rock.get('shape')} ({rock['x_mm']},{rock['y_mm']}) -> {result}", flush=True)
+        viz.text(f"{arm}: {result}", "INFO" if result in ("mined",) or result.startswith("handed") else "WARN")
+
+    # ------------------------------------------------------------------ jobs (run in arm threads)
+    def right_pick(rock, frame):
+        nonlocal scan_pose
+        mv = arms["right"]["mv"]; step = make_step("right")
+        if JUDGE:
+            try:
+                p = judge.is_target(frame, rock, rule["rule_text"])
+                if p < judge.SURE_NO:
+                    blacklist.append((rock["x_mm"], rock["y_mm"])); record("right", rock, f"not a target (jev {p:.2f})"); return
+            except Exception as e:
+                print("  jev target check failed (ignored):", e, flush=True)
+        rt, _ = execute.memory_get(rock.get("shape", "_other"))
+        try:
+            plan = execute.plan_pick(rock, skill, calib, shift=execute.rt_to_world(rt, np.arctan2(rock["y_mm"], rock["x_mm"])))
+        except ValueError as e:
+            blacklist.append((rock["x_mm"], rock["y_mm"])); record("right", rock, f"cannot plan: {e}"); return
+        scan_pose = plan["above_bin"]
+        in_zone = overlap is not None and overlap[min(479, max(0, rock["v"])), min(639, max(0, rock["u"]))]
+        zone_held = {"yes": False}
+        def step(name, _s=step):
+            if name == "approach" and in_zone and not zone_held["yes"]:
+                arms["right"]["status"] = "waiting for the shared area"
+                while not ZONE.acquire(timeout=0.3):
+                    if st["quit"]: raise KeyboardInterrupt
+                zone_held["yes"] = True
+            if name in ("carry", "home") and zone_held["yes"]:
+                ZONE.release(); zone_held["yes"] = False
+            _s(name)
+        vis = execute.Vision(skill, calib, rock, lambda: cam.fresh("right_wrist"), lambda d: None) if JUDGE else None
+        def push(plan_r):
+            if "left" not in arms or not arms["left"]["lock"].acquire(blocking=False):
+                return False                                 # left arm busy: no assist this time
+            try:
+                R2L, tzL = assist.frames()
+                pp = assist.plan_push((rock["x_mm"], rock["y_mm"]), plan_r["tip"], arms["left"]["mv"].q, R2L, tzL)
+                if pp["err"] > 6:
+                    return False
+                arms["left"]["status"] = "PUSHING object into the right gripper"
+                assist.do_push(arms["left"]["mv"], pp, arms["left"]["rest"]); return True
+            except Exception as e:
+                print("  push assist failed:", e, flush=True); return False
+            finally:
+                arms["left"]["status"] = "idle (rest)"; arms["left"]["lock"].release()
+        try:
+            res = execute.pick_place(mv, plan, skill, step, vis=vis, assist=push, end_pose=scan_pose)
         finally:
-            if mvL is not None:
+            if zone_held["yes"]: ZONE.release()
+        ok = bool(res.get("held")) and (res.get("at_drop") or {}).get("held", False)
+        if res.get("reason") != "object lost":
+            execute.memory_put(rock.get("shape", "_other"), res.get("shift_rt", rt), ok)
+        info["mined"] += int(ok)
+        record("right", rock, "mined" if ok else (res.get("reason") or ("missed grasp" if not res.get("held") else "dropped on the way")), res)
+        viz.value("mission/mined", info["mined"])
+
+    def left_handoff(rock, frame):
+        mv = arms["left"]["mv"]; step = make_step("left")
+        rt, _ = execute.memory_get(rock.get("shape", "_other"))
+        xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
+        vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL}, lambda: cam.fresh("left_wrist"), lambda d: None)
+               if JUDGE and "left_wrist" in cam.cams else None)
+        def spot_free():
+            f = cam.fresh("top"); objs, _ = perceive.detect(f)
+            return not any(np.hypot(o["u"] - spot[0], o["v"] - spot[1]) < 40 for o in objs)
+        held_zone = {}
+        try:
+            res = two_arm.left_handoff(mv, (rock["u"], rock["v"]), skill, spot, step, vis=vis, shift_rt=rt,
+                                       zone=ZONE, spot_free=spot_free, held_zone=held_zone)
+        except ValueError as e:
+            res = {"held": False, "reason": f"cannot plan: {e}"}
+        finally:
+            if held_zone.get("yes"): ZONE.release()
+        if res.get("held"):
+            info["handed"] += 1
+        record("left", rock, "handed to the right arm" if res.get("held") else ("left: " + (res.get("reason") or "missed grasp")), res)
+
+    def go_rest(arm):
+        arms[arm]["mv"].move(arms[arm]["rest"]); arms[arm]["at_rest"] = True
+
+    def run_job(arm, name, fn, *a):
+        def wrap():
+            with arms[arm]["lock"]:
+                arms[arm]["job_name"] = name
                 try:
-                    if np.abs(mvL.read() - homeL).max() > 3: mvL.move(homeL)
-                    mvL.f.disconnect()
+                    fn(*a)
+                except KeyboardInterrupt:
+                    print(f"  [{arm}] stopped: opening gripper, going to rest", flush=True)
+                    mv = arms[arm]["mv"]
+                    try:
+                        mv.gripper(skill["gripper"]["open"] + 8, wait=0.3)
+                        if np.abs(mv.q - arms[arm]["rest"]).max() > 10:
+                            up = mv.q.copy(); up[1] = max(up[1] - 15, arms[arm]["rest"][1]); mv.move(up)
+                        mv.move(arms[arm]["rest"])
+                    except Exception as e:
+                        print(f"  [{arm}] abort move failed: {e}", flush=True)
                 except Exception as e:
-                    print("left arm shutdown:", e, flush=True)
-            json.dump(log, open(HERE / "logs" / time.strftime("mission_%H%M%S.json"), "w"), indent=1)
-            print(f"MISSION END: mined {info['mined']} in {time.time() - (info['t0'] or time.time()):.0f}s", flush=True)
-            try: root.destroy()
+                    import traceback; traceback.print_exc()
+                    print(f"  [{arm}] job error: {e}", flush=True)
+                finally:
+                    arms[arm]["status"] = "idle (rest)" if arms[arm]["at_rest"] else "idle (scanning above the bin)" if arm == "right" else "idle"
+                    arms[arm]["job"] = None
+        if arm == "right" and name != "rest": arms[arm]["at_rest"] = False
+        if arm == "left": arms[arm]["at_rest"] = name == "rest"
+        t = threading.Thread(target=wrap, daemon=True); arms[arm]["job"] = t; t.start()
+
+    def ask_spark(rocks):    # background: Spark orders the right arm's targets (dispatcher never waits for it)
+        def go():
+            try:
+                d, src = plan_next(rule, rocks, list(history))
+                info["brain"] = f"{src}: {d.get('why', '')} {d.get('plan', '')}"
+            except Exception as e:
+                info["brain"] = f"spark error: {e}"
+        threading.Thread(target=go, daemon=True).start()
+
+    # ------------------------------------------------------------------ dispatcher
+    ui("SPACE to start")
+    while st["pause"] and not st["quit"]:
+        ui("SPACE to start"); time.sleep(0.05)
+    info["t0"] = time.time(); n_targets_seen = 0
+    try:
+        while not st["quit"]:
+            ui()
+            if st["pause"]:
+                time.sleep(0.05); continue
+            frame = cam.fresh("top")
+            rocks, _ = perceive.scene(frame, calib)
+            busy_tips = [_tip_px(n, getattr(a["mv"], "q_cmd", a["mv"].q)) for n, a in arms.items() if a["job"] is not None]
+            cand = []
+            for r in rocks:
+                if any(np.hypot(r["u"] - t[0], r["v"] - t[1]) < CARRY_IGNORE_PX for t in busy_tips):
+                    continue                    # being carried / worked on right now
+                if near(r, blacklist):
+                    continue
+                r["arm"] = reach(r)
+                if r["arm"] != "none":
+                    cand.append(r)
+            if cand:
+                info["last_seen"] = time.time()
+            if len(cand) > n_targets_seen and BACKEND != "rule":
+                ask_spark(cand)                 # new objects appeared: let Spark (re)order them in the background
+            n_targets_seen = len(cand)
+            right_t = [r for r in cand if r["arm"] == "right"]
+            left_t = [r for r in cand if r["arm"] == "left"]
+            if arms["right"]["job"] is None and right_t:
+                at_spot = [r for r in right_t if spot is not None and np.hypot(r["u"] - spot[0], r["v"] - spot[1]) < 40]
+                pick = at_spot[0] if at_spot else None
+                if pick is None and _ORDER:
+                    with _order_lock:
+                        for pos in list(_ORDER):
+                            pick = next((r for r in right_t if np.hypot(r["x_mm"] - pos[0], r["y_mm"] - pos[1]) < 30), None)
+                            if pick: break
+                pick = pick or min(right_t, key=lambda r: np.hypot(r["x_mm"], r["y_mm"]))
+                run_job("right", f"pick {pick['id']} {pick.get('shape')}", right_pick, pick, frame)
+            if "left" in arms and arms["left"]["job"] is None and left_t:
+                pick = min(left_t, key=lambda r: np.hypot(*two_arm.px_to_arm("left", r["u"], r["v"])))
+                run_job("left", f"hand over {pick['id']} {pick.get('shape')}", left_handoff, pick, frame)
+            # nothing to do for a while: right arm leaves the bin and rests so the camera sees the whole table
+            if (not cand and arms["right"]["job"] is None and not arms["right"]["at_rest"]
+                    and time.time() - info["last_seen"] > IDLE_REST_S):
+                arms["right"]["at_rest"] = True
+                run_job("right", "rest", go_rest, "right")
+            if not cand and all(a["job"] is None for a in arms.values()) and arms["right"]["at_rest"]:
+                ui("table clear inside the black lines: watching for new objects ...")
+            time.sleep(0.15)
+    finally:
+        st["quit"] = True
+        for n, a in arms.items():
+            if a["job"] is not None: a["job"].join(timeout=60)
+        for n, a in arms.items():
+            try:
+                if np.abs(a["mv"].read() - a["rest"]).max() > 3:
+                    st["pause"] = False; a["mv"].hold = None; a["mv"].move(a["rest"])
+            except Exception as e:
+                print(f"{n} final rest move failed: {e}", flush=True)
+        json.dump(log, open(HERE / "logs" / time.strftime("mission_%H%M%S.json"), "w"), indent=1)
+        print(f"MISSION END: mined {info['mined']}, handed over {info['handed']} in {time.time() - (info['t0'] or time.time()):.0f}s", flush=True)
+        try: root.destroy()
+        except Exception: pass
+        for a in arms.values():
+            try: a["mv"].f.disconnect()
             except Exception: pass
-            follower.disconnect()
-            cam.stop()
+        cam.stop()
 
 
 if __name__ == "__main__":

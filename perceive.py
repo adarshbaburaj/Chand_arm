@@ -42,6 +42,22 @@ def shape_of(c, w, h):
     return {4: "square", 5: "pentagon", 6: "hexagon"}.get(n, "round" if n > 6 else f"poly{n}")
 
 
+_WA = None
+
+
+def in_work_area(u, v):
+    """True if pixel (u, v) is between the two black tape lines (work_area.json); everything counts if no file."""
+    global _WA
+    if _WA is None:
+        import os
+        f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work_area.json")
+        _WA = json.load(open(f)) if os.path.exists(f) else {}
+    if not _WA:
+        return True
+    (a, b), (c, d), m = _WA["top_line"], _WA["bottom_line"], _WA.get("inset_px", 6)
+    return a * u + b + m < v < c * u + d - m
+
+
 def detect(img):
     objs = []
     cnts, _ = cv2.findContours(red_mask(img), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -53,6 +69,8 @@ def detect(img):
             continue
         (cx, cy), (w, h), ang = cv2.minAreaRect(c)
         if x0 <= cx <= x1 and y0 <= cy <= y1:
+            continue
+        if not in_work_area(cx, cy):          # outside the black lines: not our job
             continue
         objs.append({"id": f"red_{len(objs)}", "colour": "red", "u": round(cx), "v": round(cy),
                      "angle_deg": round(ang, 1), "size_px": round(max(w, h)), "contour": c, "shape": shape_of(c, w, h)})

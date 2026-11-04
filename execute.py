@@ -63,6 +63,7 @@ class Mover:
         return q
 
     def _send(self, q, grip):
+        self.q_cmd = np.asarray(q, float) - self.bias       # live commanded pose (other threads read it)
         viz.joints(self.name, q_cmd=q); viz.gripper(self.name, cmd=grip)
         self.f.send_action({**{k: float(v) for k, v in zip(J, q)}, "gripper.pos": float(grip)})
 
@@ -262,6 +263,14 @@ def world_to_rt(sh, az):
     return (sh[0] * np.cos(az) + sh[1] * np.sin(az), -sh[0] * np.sin(az) + sh[1] * np.cos(az))
 
 
+def bin_drop_q(skill):
+    """Drop pose: the hand-taught bin centre (teach_bin.py -> bin_drop.json), else the teach demo's drop pose."""
+    import json
+    from pathlib import Path
+    f = Path(__file__).with_name("bin_drop.json")
+    return np.array(json.loads(f.read_text())["q_deg"] if f.exists() else skill["drop_q_deg"], float)
+
+
 def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     """Joint targets for one rock, from the demo's grasp style:
     the demo's tip offset and tool tilt are expressed relative to the rock's direction from the base and
@@ -293,12 +302,15 @@ def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     C = np.array(skill["carry_q_deg"], float)
     delta = q_grasp - np.array(skill["grasp"]["q_deg"], float)
     s = np.linspace(0, 1, len(C))[:, None]
-    carry = C + delta * (1 - s) ** 2
+    drop = bin_drop_q(skill)
+    T = kin.fk(drop)                       # arrive 45 mm ABOVE the taught bin centre (clear the rim), then go straight down
+    above_bin, _ = kin.ik(T[:3, 3] + [0, 0, 45.0], drop, down=False, axis=T[:3, 2])
+    carry = C + delta * (1 - s) ** 2 + (above_bin - np.array(skill["drop_q_deg"], float)) * s ** 2
     # demo carry starts at its grasp: start ours from the lift pose (first third replaced by lift)
     k = max(1, len(C) // 4)
     carry = np.vstack([q_lift, carry[k:]])
     tz = [kin.fk_xyz(q)[2] for q in carry]
-    return dict(q_pre=q_pre, q_grasp=q_grasp, q_lift=q_lift, descend=descend, lift=lift, carry=carry, drop=np.array(skill["drop_q_deg"], float),
+    return dict(q_pre=q_pre, q_grasp=q_grasp, q_lift=q_lift, descend=descend, lift=lift, carry=carry, drop=drop, above_bin=above_bin,
                 tip=tip.round(1).tolist(), ik_err=round(err, 1), tilt_blend=blend, carry_min_z=round(float(min(tz)), 1),
                 pre_tip=(tip - APPROACH_MM * axis), axis=axis, az=float(np.arctan2(y, x)), shift=list(shift),
                 rock=rock, calib=calib)
@@ -317,13 +329,13 @@ def _retreat(mv, plan):
     mv.follow(plan["descend"][::-1][1:], peak_deg_s=25)
 
 
-def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, place=None):
+def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, place=None, end_pose=None):
     """Executes a plan. step(name) is called before each phase (the mission uses it for step mode / HUD).
     vis (optional, see Vision) adds the camera checks: aim before closing, hold after lifting.
     Returns dict(held=bool, grip=value, aim=[...], hold=...)."""
     g = skill["gripper"]
     g_open = g["open"] + 8          # a little wider than the demo for slack
-    home = mv.q.copy()
+    home = mv.q.copy() if end_pose is None else np.asarray(end_pose, float)   # where to finish (rest or scan pose)
     out = {"aim": []}
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
     if vis is not None and vis.jac is None and not Vision.calib_failed:
@@ -398,11 +410,15 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
         place(mv, plan)
     elif held:
         step("carry");  mv.follow(plan["carry"][1:])
-        mv.move(plan["drop"], settle_s=0.5)
-        step("drop");   mv.gripper(g_open, wait=0.6)
+        mv.move(plan["drop"], settle_s=0.3)
+        pos, load, cur = mv.grip_sense()                 # still pushing back over the bin = it really got there
+        out["at_drop"] = {"pos": round(pos, 1), "load": load, "cur": cur, "held": bool(pos > GRIP_CLOSED + 2.0 and pushback(load, cur))}
+        step("drop");   mv.gripper(g_open, wait=0.5)
+        if "above_bin" in plan:
+            mv.move(plan["above_bin"], settle_s=0.2)     # fingers out of the bin before anything else
     else:
         mv.gripper(g_open, wait=0.3)
-    step("home");     mv.move(home, grip=g["close_cmd"] + 6)  # gripper nearly closed at rest, not squeezing
+    step("home");     mv.move(home, grip=g["close_cmd"] + 6)  # rest, or the scan pose
     out.update(held=held, grip=gm, shift_rt=[round(float(v), 1) for v in world_to_rt(plan["shift"], plan["az"])])
     return out
 

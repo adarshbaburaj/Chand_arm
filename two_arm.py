@@ -81,7 +81,11 @@ def handoff_spot(skill):
     raise RuntimeError("no spot reachable by both arms")
 
 
-def left_handoff(mv_left, rock_px, skill, spot_px, step=lambda n: None, vis=None, shift_rt=(0.0, 0.0)):
+def left_handoff(mv_left, rock_px, skill, spot_px, step=lambda n: None, vis=None, shift_rt=(0.0, 0.0), zone=None, spot_free=None,
+                 held_zone=None):
+    """zone: threading.Lock for the shared area; acquired before entering it, released by the caller after the left arm
+    is home (held_zone['yes'] tells the caller it holds it)."""
+    held_zone = {} if held_zone is None else held_zone
     """Left arm: pick the object at rock_px (force-feedback grasp + regrasp search, same as the right arm), carry it
     to spot_px and put it down gently with the same grasp pose, open, back off, go home."""
     cl = calib("left")
@@ -91,6 +95,22 @@ def left_handoff(mv_left, rock_px, skill, spot_px, step=lambda n: None, vis=None
     put = execute.plan_pick({"x_mm": sx, "y_mm": sy}, skill, cl)        # same grasp pose, at the spot
 
     def place(mv, plan_used):
+        # the handoff spot is in the shared area: wait for the zone (right arm not working there) and a free spot
+        import time
+        t0 = time.time()
+        while True:
+            step("left: waiting for the handoff spot")
+            if zone is None or zone.acquire(timeout=0.5):
+                if spot_free is None or spot_free():
+                    break
+                if zone is not None: zone.release()
+            if time.time() - t0 > 60:
+                raise RuntimeError("handoff spot stayed busy for 60 s")
+            time.sleep(0.5)
+        held_zone["yes"] = zone is not None
+        _place(mv)          # the CALLER releases the zone once the left arm is back home (see held_zone)
+
+    def _place(mv):
         step("left: carry to handoff spot")
         mv.move(put["q_lift"])
         mv.follow(put["lift"][::-1][1:], peak_deg_s=20)                  # straight down into the put-down pose
