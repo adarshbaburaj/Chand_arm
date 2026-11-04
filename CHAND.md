@@ -1,0 +1,144 @@
+# Chand — Meta hackathon side project (read this first)
+
+Created 2026-11-04 18:58 Dubai. **Submit by 05:30 Dubai on 2026-11-05 (hard deadline 06:00).** That is about 10.5 h from creation.
+This is a side project, separate from the Malta challenge. Malta context lives in `~/SO101_handoff.md`.
+Project folder: `~/chand/`. All new code goes here. Nothing in `~/so101_*` or `~/workspaces/lerobot_v061` gets edited.
+
+## What we are building
+A SO-101 arm on the Orin "mines iron ore" (red 3D-printed shapes) into the red bin with **zero training**.
+Story: an astronaut teaches it **once** from Earth (one leader-arm demo), then the rover works alone on the Moon, fully offline.
+
+- **Earth mode (the problem):** leader drives the follower through a 2.6 s delay buffer. Clumsy on purpose.
+- **Teach once (Earth, internet OK):** one leader demo of picking a red object into the red bin. The Muse Spark API reads the demo and writes the rule ("red rocks go in the bin, white stay").
+- **Moon mode (offline):** top cam + SAM 3 find rocks. Muse Glimmer (local) picks the next target. The executor adapts the demo motion to the new rock, the verifier checks, and it loops until no red rocks remain.
+- **Wow shot:** unplug the ethernet mid-mission and it keeps mining.
+
+## Rules carried over from the SO101 handoff (still apply)
+1. **The Jetson torch must not be replaced.** The env is `~/workspaces/lerobot_v061_env` (py3.12, self-built torch 2.11.0 sm_87, CUDA 12.6). Before and after every install, run
+   `~/workspaces/lerobot_v061_env/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"` → must print `2.11.0 True`.
+   Install with `--no-deps` or a constraints file. Never pull `nvidia-*` pip wheels.
+2. **No motion, torque or calibration unless the user is present.**
+3. Use the arm names and aliases exactly (below). Never use `ttyCH341USBn` or `videoN`.
+4. Never read the motors while a lerobot process holds the port. Kill by pid, not `pkill -f`.
+5. **Gripper overload lesson:** the STS3215 gripper trips "Overload error" (Overload_Torque 25) if it squeezes for a long time. Command the close to just past the object width, not to 0, and open before any long wait.
+6. Log every check/test in `~/so101_daily/checks_log.md` (prefix `[CHAND]`) and keep this file current.
+7. No duplicate scripts. One file per job, as listed below.
+
+## Hardware (facts from the rig, not placeholders)
+- Orin AGX 64 GB, JetPack 6.2.3 / L4T R36.5.2, CUDA 12.6, MAXN already set. 748 GB free on the NVMe, 61 GB RAM.
+- **Use the RIGHT arm.** Calibration files `thumbi_right` (follower + leader) already exist in `~/.cache/huggingface/lerobot/calibration/`.
+
+| Role | Path | Note |
+|---|---|---|
+| right follower | **`/dev/ttyFollowerLeft`** (top socket 1-4.4) | Plugged into the TOP socket. Verified 19:10 by reading Homing_Offset: all 6 match `thumbi_right`. So for Chand use port `/dev/ttyFollowerLeft` + id `thumbi_right`. |
+| right leader | `/dev/ttyLeaderRight` (cable 4, 1-1.3) | present |
+| top cam | `/dev/v4l/by-path/platform-3610000.usb-usb-0:4.2:1.0-video-index0` | present (640x480@30 MJPG) |
+| right wrist cam | `/dev/v4l/by-path/platform-3610000.usb-usb-0:4.1.3:1.0-video-index0` | present |
+| left follower | — | not plugged in |
+
+`lerobot-find-port` / `find-cameras` are not needed. The udev aliases are fixed per socket.
+
+## Hard rules for this project
+1. Never run SAM and Glimmer at the same time. Perceive, then think, then move.
+2. Glimmer is never in the motion loop. One call per decision.
+3. Glimmer gets the scene as **text** (an object list in mm), not images.
+4. Take snapshots only with the arm parked out of the top cam's view.
+5. Safety: low max joint speed (`max_relative_target` ≤ 10), workspace limits checked before every move, and a software e-stop.
+6. Moon mode makes **zero** network calls. `--offline` sets `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` and patches `socket.socket.connect` so that anything other than 127.0.0.1 raises.
+7. One arm working end to end before the second arm.
+
+## Architecture (one engine)
+`instruction → brain (task list JSON) → executor (grasp pose, IK, motion) → verifier → loop`
+Eyes (top cam + SAM → objects in arm mm) feed the brain, executor and verifier.
+
+The brain may ONLY output:
+```json
+{"skill": "pick", "obj": "<id>", "arm": "right"}
+{"skill": "place_in", "target": "red_bin"}
+{"skill": "done"}
+```
+
+## Files (all in ~/chand/)
+| File | Job |
+|---|---|
+| `config.yaml` | ports/cams (the aliases above), speed limits, bin drop pose (joints), park pose (joints), workspace box, backend |
+| `calibrate.py` | Touch calibration: jog the tip onto taped crosses with the leader, record FK (x, y), click the same crosses in the top image, `cv2.findHomography` → `calib.json`. Print the reprojection error. |
+| `kin.py` | FK/IK for SO-101 (URDF from SO-ARM100). LeRobot degrees → URDF radians. Top-down grasp, wrist roll = object angle. |
+| `perceive.py` | snapshot → SAM 3 ("red object", "white object") → masks → HSV check → centroid + `minAreaRect` angle → homography → `[{id, colour, x_mm, y_mm, angle_deg, size_mm}]`. Fallback: pure HSV. |
+| `teach.py` | Record ONE demo at 30 Hz (joints, gripper, top frames). Split at gripper close/open. Grasp style = FK at grasp vs the rock seen in frame 0. Keep carry + drop joints. Muse Spark → rule JSON. Save `skill.json`. |
+| `brain.py` | `plan(instruction, scene, rule)` → task list. Backends `meta_api` and `glimmer_local` (llama.cpp server, OpenAI-compatible). Strict JSON validation, one retry, then a plain rule fallback. |
+| `execute.py` | IK for the new grasp = rock pose + grasp style. Blend the demo-vs-new joint offset in over the approach and out over the carry. Hover 60 mm → descend → close → lift → carry → drop → park. |
+| `verify.py` | Holding check from the gripper position. Placement check from a fresh snapshot. Up to 2 retries. |
+| `hud.py` | Live window: feed, mask outlines, object list, state, mined counter, mission timer. |
+| `mission.py` | Moon-mode loop, `--offline`, `--backend glimmer_local\|meta_api`. |
+| `earth_lag.py` | leader → follower through a 2.6 s ring buffer, with the HUD showing the delay. |
+
+## Milestones (each one's test must pass before moving on)
+- **M0** Setup: torch check, Glimmer GGUF downloading in tmux, llama.cpp built with CUDA (sm_87), SAM weights downloaded.
+- **M1** Right-arm teleop works. Top cam fixed, exposure and white balance locked.
+- **M2** `perceive.py` finds every red object in < 2 s and draws outlines.
+- **M3** Touch test: the arm hovers 20 mm above 5 random rocks, each within ~10 mm. **Make or break. Do not continue until it passes.**
+- **M4** `teach.py`: one demo recorded, `skill.json` + rule JSON saved.
+- **M5** Moon mode with `meta_api`: 3 red rocks into the bin, two runs in a row, white rocks untouched.
+- **M6** Switch to `glimmer_local`, run with the ethernet unplugged.
+- **M7** `earth_lag.py` + HUD polish.
+- **M8** Stretch: left arm. Probably skip (see the changes below).
+
+## Model notes (checked on the Hub 2026-11-04)
+- **Muse Glimmer 30B:** `unsloth/Muse-Glimmer-30B-GGUF`, UD-Q4_K_XL (~18 GB). Also `ggml-org/Muse-Glimmer-30B-GGUF`. Run with `llama-server` on 127.0.0.1.
+- **SAM:** `facebook/sam3.1` is a raw **checkpoint** (needs Meta's sam3 repo code, which is a new install). `facebook/sam3` is in **transformers format**, and the env already has transformers 5.5.4 with `Sam3Model`. → Use `facebook/sam3` (no install). Both may be gated: accept the licence on the HF site and run `hf auth login`.
+- **Muse Spark:** Meta Model API, key in `~/chand/.env` as `META_API_KEY` (chmod 600; doesn't exist yet). Used only for the teach step.
+
+## Current state of the env (checked 18:57)
+- torch 2.11.0, CUDA True. transformers 5.5.4 (Sam3 present). httpx, requests, PyYAML and pynput are present.
+- Missing: `ikpy`, `scipy`, `placo` (LeRobot's own `model/kinematics.py` needs placo), llama.cpp, system cmake (only `~/workspaces/lerobot_env/bin/cmake` exists), the SAM and Glimmer weights.
+
+## Changes I suggest to the original brief
+1. **SAM 3 instead of 3.1** (above). Same idea, no new code stack.
+2. **Write the kinematics in numpy (DLS IK, about 80 lines) instead of ikpy.** ikpy pulls scipy and sympy into the torch env, and placo has no reliable aarch64 wheel. The 5-joint chain is small. The joint-frame conversion we already proved with π0.5/MolmoAct2 is signs `[1,-1,1,1,1,1]`, offsets `[0,90,90,0,0,0]` deg (verify against the URDF zero pose before trusting it).
+3. **Calibrate with 6–9 crosses, not 4.** 4 points fit a homography exactly, so errors are invisible. More points give a reprojection error to check against M3's 10 mm. Grasp at rock-top height: the homography is for the table plane, so tall rocks shift a few mm off-centre in the image (correct using the known rock height and the camera position).
+4. **Top-down grasp limits reach.** A 5-DoF SO-101 with the gripper pointing straight down reaches only about 120–280 mm from the base. Put the rocks and bin inside that ring, or allow a pitch angle of up to 30° off vertical at the edge.
+5. **E-stop via the HUD window key (cv2.waitKey), not a terminal space bar.** pynput needs focus or X. Torque-off makes the arm fall, so the e-stop should first send "hold current position", and turn torque off on a second press (or keep a hand on the 12 V plug as before).
+6. **Placement check = rock seen inside the bin ROI, or gone from the table with the gripper open over the bin.** "Gone from the table" alone also passes if the rock fell on the floor.
+7. **Skip M8 (left arm).** The left follower runs on the left leader's board, so there is no left leader for a demo. With 10 h, one polished arm wins more.
+8. **Plan B for the time limit:** if SAM is slow or gated, run M2–M5 on HSV only (red vs white on a dark mat is easy) and add SAM afterwards. M3 (calibration accuracy) is the real risk. Start it early.
+9. Use the right **wrist cam** for the holding check if the gripper position is ambiguous on thin shapes.
+
+## Decisions (19:10)
+- **Brain backend: Muse Spark API first** (user). Glimmer keeps downloading in the background for the offline wow shot (M6).
+- **API key budget:** the user gives the key when asked. Every API call is logged (count + tokens) to `logs/api_usage.jsonl`. Hard cap per run (`max_api_calls` in config.yaml, default 20). Never call in a loop without the user knowing. A dry-run mode prints the prompt instead of sending it.
+- Cameras: use top (planning/verify) + right wrist (holding check / close-up).
+- Everything on the table is within reach (user).
+- Submission = **video + public GitHub repo** `https://github.com/adarshbaburaj/chand_meta.git`. Local repo `~/chand` (git init done, remote set, nothing pushed). Models in `~/chand_models` (outside the repo).
+
+## Scene from the top cam (19:04, `snapshots/top_1904.jpg`)
+- White mat with a black tape border. The arm base sits bottom-right, partly in frame.
+- **Red bin** top-right (tall, open top). A white tray at top-left and a black box at top-centre are distractors.
+- Red ore: cylinder, cube, pentagon prism, hexagon prism (4). White: cube, pentagon prism, cylinder lying down (3).
+- Notes for perception: (1) the bin is red too → mask the fixed bin ROI out of the ore search. (2) White on a white mat has low contrast → HSV can't find white rocks; SAM is needed for them (they only need to be "left alone", so red-only HSV is fine as plan B). (3) Slight pink colour cast → lock white balance/exposure.
+- The wrist cam image is rotated ~90° (cam mounted sideways). It sees a red hex prism + the bin.
+
+## Status 20:05
+- HF login done (user adarshababurj). `META_API_KEY` in `.env` (600). **API WORKS: base `https://api.meta.ai/v1` (OpenAI-compatible, also api.ai.meta.com). Use `muse-spark-1.3` (~4 s, reasoning model: set max_tokens ≥ 600 or content is null). Fallback `muse-wonder-1.0` (~6 s, fewer reasoning tokens). Also listed: sam-3.1, muse-image-1.0, muse-voice-transcribe-1.0, spark 1.1/1.2. api.llama.com gives 401.**
+- Glimmer GGUF downloaded (15 GB). llama.cpp built (`~/workspaces/llama.cpp/build/bin`).
+- `perceive.py` HSV v1: 4/4 red rocks + bin box in 0.2 s (`snapshots/perceive_last.jpg`). White rocks not detected yet (SAM step). Pixel coords only, so mm needs calib.json (M3).
+
+## Running jobs (old, done)
+- Glimmer download: `~/chand_models/glimmer/Muse-Glimmer-30B-UD-Q4_K_XL.gguf` (15.9 GB, WiFi ~8 MB/s), log `logs/dl_glimmer.log`.
+- llama.cpp (commit 5851a8e) CUDA sm_87 build: `~/workspaces/llama.cpp/build`, log `logs/llama_build.log`.
+- SAM 3 (`facebook/sam3`, 3.4 GB): waiting for the user's HF login + licence accept.
+
+## Open questions for the user
+1. ~~Follower port~~ answered: right follower in the top socket. (Old note: at 18:57 `/dev/ttyFollowerLeft` (socket 1-4.4, cable 1) is present but `/dev/ttyFollowerRight` is not. Is that the left follower, or did the right follower's cable go into the top socket? To use the right arm, plug its USB into the socket below (1-4.3) and add the 12 V.
+2. Is the ethernet wired now (needed for the 18 GB Glimmer download), and is your HF token set up? Have you already been granted access to SAM?
+3. Do you have the `META_API_KEY` and the Muse Spark endpoint/model name?
+4. What mat colour is under the rocks, and how big are the red/white shapes (size and height)?
+5. What does the submission need: a video, a repo, a live demo?
+
+## Log
+- 2026-11-04 18:58 — File created. Read-only checks only (devices, env, Hub). No motors touched.
+- 2026-11-04 19:05 — Project renamed from Lunar Prospector to **Chand** (folder ~/chand, this file CHAND.md).
+- 2026-11-04 20:05 — HF ok, API key saved (401 on llama.com), Glimmer + llama.cpp done, perceive.py HSV v1 works.
+- 2026-11-04 20:15 — Meta API found at api.meta.ai/v1; muse-spark-1.3 and muse-wonder-1.0 both return valid JSON.
+- 2026-11-04 21:50 — **M3 PASSED.** calib 11 pts affine (LOO 7.4 mm), table_z -28.1 mm. IK seeded from nearest taught pose (45° tilt). settle() integral bias fixes gravity sag (up to 10° on elbow/lift). 4/4 rocks centred in wrist cam at 35 mm hover. Next: M4 teach.py.
+- 2026-11-04 21:22 — **M4 done.** skill.json from demo_211726 + Spark rule ("red → red_bin, leave white, stop when no red"). Use `reasoning_effort="low"` + max_tokens ≥ 4000 on every Muse call (else reasoning eats all tokens, content null). Smooth motion lives in execute.py (Mover). perceive.BIN_ROI fixed box. Next: M5 execute pick-place loop.

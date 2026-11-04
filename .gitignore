@@ -1,0 +1,7 @@
+.env
+*.gguf
+logs/
+snapshots/
+recordings/
+__pycache__/
+*.pyc
