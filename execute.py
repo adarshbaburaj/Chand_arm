@@ -433,110 +433,81 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
     # (the wrist-camera jacobian self-calibration is no longer needed: depth/side come from Jev's 'where' choice)
     step("descend");  mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
-    servo_info = vis.servo(mv, plan, step, g_open) if vis is not None and vis.zone is not None else None
-    if servo_info is not None:
-        out["servo"] = {k: v for k, v in servo_info.items() if k != "plan"}
-        plan = servo_info["plan"]
-    if vis is not None and servo_info is None:
-        # look before closing (wrist camera, Jev choice): object BEYOND the fingertips -> slide 15 mm deeper in place,
-        # off to one side -> slide 10 mm sideways; up to 3 corrections. (run 13: left arm closed on air with the
-        # object a full width beyond the tips.) Good grasps score 'beyond' ~0.6, real misses 0.84-0.97.
-        for k in range(3):
-            step("check depth (wrist camera)")
-            w = vis.where()
-            out["aim"].append({"where": w.get("choice"), "p": {kk: round(v, 2) for kk, v in (w.get("p") or {}).items()}})
-            pb = (w.get("p") or {}).get("beyond", 0)
-            if pb > 0.8:
-                dp = (15.0, 0.0)
-            elif w.get("choice") == "none" and (w.get("p") or {}).get("none", 0) > 0.8:
-                print("  no object near the fingers: skip close", flush=True)
-                _retreat(mv, plan); mv.move(home, grip=g["close_cmd"] + 6)
-                out.update(held=False, grip=None, reason="object not at the fingers"); return out
-            else:
-                break
-            new = vis.replan(plan, dp)
-            path, err = line(plan["tip"], new["tip"], mv.q, new["axis"], step_mm=5)
-            if err > 6:
-                break
-            print(f"  aim: object beyond the fingertips (p {pb:.2f}) -> sliding {dp[0]:.0f} mm deeper before closing", flush=True)
-            mv.follow(path[1:], grip=g_open, peak_deg_s=15); mv.move(new["q_grasp"], grip=g_open, settle_s=0.5)
-            plan = new
-    # ---- force-feedback grasp ladder (user, 03:35):
-    #   grasp 1 fails -> IMMEDIATELY grasp 2: jaws wider + slide 15 mm deeper at grasp height (no backing out)
-    #   grasp 2 fails -> back off a few cm and let the LEFT arm take the object to the handoff spot (assist);
-    #                    the caller then picks it there. No assist possible -> grasp 3: full retreat, Jev says
-    #                    which way (or a search pattern), widest jaws.
-    OPEN_STEPS = [g_open, 45.0, 58.0, 58.0]  # gripper.pos 0-100 %
-    tang = [(0.0, 10.0), (0.0, -20.0)]
+    # (user, 04:55: the arms were in a perfect position and the camera servo moved them away -> NO camera
+    #  corrections before the first grasps; all troubleshooting starts only after 3 simple grasps failed)
+    # ---- grasp ladder (user, 04:55): keep it simple first.
+    #   SIMPLE (no camera, no thinking): 1 the planned grasp; 2 jaws wider (45 %) + slide 10 mm deeper in place;
+    #                                    3 jaws widest (58 %) + slide 10 mm more.
+    #   TROUBLESHOOTING, only after 3 failures: back off (right arm: the LEFT arm takes the object to the handoff
+    #   spot); else camera servo into the capture zone + close; else steeper angle of attack, 8 mm higher + close.
     out["grasps"] = []
-    backed_off = False
+
+    def close(label):
+        step(f"close: {label}")
+        ff = mv.grasp_ff(GRIP_CLOSED)
+        out["grasps"].append({kk: ff[kk] for kk in ("contact", "held", "pos", "load")} | {"how": label, "shift": plan.get("shift")})
+        viz.text(f"grasp '{label}': contact {ff['contact']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", "INFO" if ff["held"] else "WARN")
+        print(f"  grasp '{label}': contact {ff['contact']} pos {ff['pos']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", flush=True)
+        return ff
 
     def replan(p, dp, **kw):
         kw = {"tilt_min": p.get("tilt_min", 0.0), "dz": p.get("dz", 0.0), **kw}
         return plan_pick(p["rock"], skill, p["calib"], shift=_add_shift(p, dp), **kw)
 
-    for k in range(MAX_GRASPS):
-        step(f"close {k + 1} (force feedback)")
-        ff = mv.grasp_ff(GRIP_CLOSED)
-        out["grasps"].append({kk: ff[kk] for kk in ("contact", "held", "pos", "load")} | {"shift": plan.get("shift")})
-        viz.text(f"grasp {k + 1}: contact {ff['contact']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}",
-                 "INFO" if ff["held"] else "WARN")
-        print(f"  grasp {k + 1}: contact {ff['contact']} pos {ff['pos']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", flush=True)
-        if ff["held"] or k == MAX_GRASPS - 1:
-            break
-        g_open = OPEN_STEPS[min(k + 1, len(OPEN_STEPS) - 1)]
-        if k == 0:
-            # immediate second grasp: open wider right here, slide deeper along the table, close again
-            step(f"grasp 2 now: jaws {g_open:.0f} % + 15 mm deeper"); mv.gripper(g_open, wait=0.25)
-            new = replan(plan, (15.0, 0.0))
-            path, err = line(plan["tip"], new["tip"], mv.q, new["axis"], step_mm=5)
-            if err <= 6:
-                print(f"  grasp 2: jaws {g_open:.0f} %, sliding 15 mm deeper", flush=True)
-                mv.follow(path[1:], grip=g_open, peak_deg_s=15); mv.move(new["q_grasp"], grip=g_open, settle_s=0.6)
-                plan = new
-                continue
-            print(f"  grasp 2: cannot slide deeper in place (IK {err:.0f} mm) -> back out and re-approach", flush=True)
-            _retreat(mv, plan); plan = new
-            mv.move(plan["q_pre"], grip=g_open)
-            mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=0.8)
-            continue
-        # k >= 1: Jev says which way the object is (photo at grasp height); k == 1 also backs off for the left arm
-        dp = tang[0]
-        if vis is not None:            # which way is the object? (photo taken at grasp height, before backing off)
-            w = vis.where()
-            out.setdefault("where", []).append(w)
-            if w["p"].get("beyond", 0) > 0.8:
-                dp = (12.0, 0.0)
-            elif w.get("choice") in ("left", "right"):
-                dp = tang[1] if w.get("choice") == "right" else tang[0]
-        _retreat(mv, plan)
-        if k == 1:
-            # two misses: back off a few cm so the left arm has room, and ask it to help
-            step("backing off for the left arm"); backed_off = True
+    def slide_deeper(mm, jaws):
+        nonlocal plan
+        mv.gripper(jaws, wait=0.25)
+        new = replan(plan, (mm, 0.0))
+        path, err = line(plan["tip"], new["tip"], mv.q, new["axis"], step_mm=5)
+        if err <= 6:
+            mv.follow(path[1:], grip=jaws, peak_deg_s=15); mv.move(new["q_grasp"], grip=jaws, settle_s=0.5)
+            plan = new
+            return True
+        return False
+
+    def reapproach(new, jaws):
+        nonlocal plan
+        _retreat(mv, plan); plan = new
+        mv.move(plan["q_pre"], grip=jaws)
+        mv.follow(plan["descend"][1:], grip=jaws, peak_deg_s=25); mv.move(plan["q_grasp"], grip=jaws, settle_s=0.8)
+
+    ff = close("1 planned")
+    if not ff["held"]:
+        slide_deeper(10.0, 45.0); ff = close("2 wider + 10 mm deeper")
+    if not ff["held"]:
+        slide_deeper(10.0, 58.0); ff = close("3 widest + 10 mm deeper")
+    if not ff["held"]:
+        # ------------------------------------------------ troubleshooting (3 simple grasps failed)
+        jaws = 58.0
+        mv.gripper(jaws, wait=0.25)
+        print("  3 simple grasps failed -> troubleshooting", flush=True); viz.text("3 simple grasps failed: troubleshooting")
+        # a) right arm: back off a few cm, the left arm brings the object to the handoff spot
+        if assist is not None:
+            step("backing off for the left arm"); _retreat(mv, plan)
             T = kin.fk(mv.q); q_up, e = kin.ik(T[:3, 3] + [0, 0, 40.0], mv.q, down=False, axis=T[:3, 2])
             if e < 5:
-                mv.move(q_up, settle_s=0.2)               # ~6 cm back along the approach + 4 cm up
-            out["standby_q"] = mv.q.copy()
-            if assist is not None:
-                step("waiting: LEFT arm takes the object to the handoff spot")
-                if assist(plan):
-                    out.update(held=False, grip=ff["pos"], reason="assisted", shift_rt=[0.0, 0.0])
-                    return out                            # caller picks it at the handoff spot from here
-            # grasp 3: CHANGE THE ANGLE OF ATTACK (steeper, more from above) and grip 8 mm higher, widest jaws
+                mv.move(q_up, settle_s=0.2)
+            step("waiting: LEFT arm takes the object to the handoff spot")
+            if assist(plan):
+                out.update(held=False, grip=ff["pos"], reason="assisted", shift_rt=[0.0, 0.0])
+                return out
+            mv.move(plan["q_pre"], grip=jaws)
+            mv.follow(plan["descend"][1:], grip=jaws, peak_deg_s=25); mv.move(plan["q_grasp"], grip=jaws, settle_s=0.8)
+        # b) camera servo into the capture zone (only now), then close
+        if vis is not None and vis.zone is not None:
+            sv = vis.servo(mv, plan, step, jaws)
+            out["servo"] = {k: v for k, v in sv.items() if k != "plan"}
+            plan = sv["plan"]
+            if sv["result"] != "object not seen":
+                ff = close("4 camera servo")
+        # c) steeper angle of attack, grip 8 mm higher
+        if not ff["held"]:
             try:
                 new = replan(plan, (0.0, 0.0), tilt_min=max(0.5, plan.get("tilt_blend", 0.0) + 0.25), dz=8.0)
-                step(f"grasp 3: new angle (tilt {new['tilt_blend']}), 8 mm higher, jaws {g_open:.0f} %")
-                print(f"  grasp 3: steeper angle of attack (tilt blend {new['tilt_blend']}), 8 mm higher, jaws {g_open:.0f} %", flush=True)
-                plan = new
+                mv.gripper(jaws, wait=0.25); reapproach(new, jaws)
+                ff = close("5 steeper angle, 8 mm higher")
             except ValueError as e:
-                print(f"  grasp 3: no steeper approach here ({e}) -> re-aim {dp}", flush=True)
-                plan = replan(plan, dp)
-        else:
-            # grasp 4: normal angle again, re-aim the way Jev saw the object
-            step(f"grasp 4: re-aim {dp}, jaws {g_open:.0f} %")
-            plan = replan(plan, dp, tilt_min=0.0, dz=0.0)
-        mv.move(plan["q_pre"], grip=g_open)
-        mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=0.8)
+                print(f"  no steeper approach here: {e}", flush=True)
     gm = ff["pos"]
     held = ff["held"]
     step("lift");     mv.follow(plan["lift"][1:], peak_deg_s=25)
