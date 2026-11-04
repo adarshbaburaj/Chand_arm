@@ -4,6 +4,55 @@ Created 2026-11-04 18:58 Dubai. **Submit by 05:30 Dubai on 2026-11-05 (hard dead
 This is a side project, separate from the Malta challenge. Malta context lives in `~/SO101_handoff.md`.
 Project folder: `~/chand/`. All new code goes here. Nothing in `~/so101_*` or `~/workspaces/lerobot_v061` gets edited.
 
+## FOR ANY AI ASSISTANT PICKING THIS UP (kept current, 2026-11-05 01:15 Dubai)
+Several AI assistants help build this. Read this section, then `## User requirements`, then the code. Run everything in
+`source ~/workspaces/lerobot_v061_env/bin/activate` (torch 2.11.0 + CUDA must stay; check `python -c "import torch;print(torch.__version__, torch.cuda.is_available())"` before/after any install).
+Secrets live in `.env` (gitignored, chmod 600): `META_API_KEY`, `TYPESAFE_API_KEY`. Never commit or print them.
+Commits carry the user's name only (no Co-Authored-By lines).
+
+### Current architecture (what actually runs)
+```
+top cam ─▶ perceive.py (HSV red, bin box ignored, affine px→mm from calib.json)
+            │
+            ▼
+  Muse Spark (brain.py, cloud, ~4-9 s)  ── picks WHICH object (JSON, validated; failed-twice rocks excluded)
+            │
+  Jev (judge.py, TypeSafe cloud, ~0.4 s) ── fast typed yes/no + boxes from camera frames:
+            │     is_target (top crop) · wrist_look "between the fingers?" + box · held (after lift)
+            │     unsure (0.3-0.7) or disagrees with the servo → Muse Spark cross-check with the image
+            ▼
+  execute.py  plan_pick: demo grasp style rotated to the new rock, IK (kin.py), straight-line descend/lift
+              Mover: min-jerk 50 Hz, gravity-sag integral bias, every command clipped to 5° (max_relative_target)
+              grasp_ff: FORCE FEEDBACK — close slowly, contact = jaw lags the command / load rises (STS3215
+                        Present_Load), squeeze only 2.5° past contact, held = pushback after settling and after lift
+              regrasp: closed on air → reopen, look (Jev box → shift via wrist image jacobian) or search pattern
+                       (±8 mm tangential/radial), back up straight, re-descend; up to 3 grasps per object
+            ▼
+  verify: fresh top-cam look, object gone from its spot + held → "mined"
+```
+Low-level control is NEVER an AI model (needs 50 Hz). Models decide what/whether; code decides how.
+
+### Commands
+- Mission: `DISPLAY=:1 python mission.py --backend meta_api --max-picks 6` (window starts PAUSED, SPACE start, Q = safe abort home). `--no-judge` turns Jev off, `--offline` blocks all network except localhost.
+- Gripper force probe: `python grip_probe.py empty` / `python grip_probe.py object` (object held in the jaws by hand).
+- Judge self-test on saved frames: `python judge.py a.jpg b.jpg`.
+- Logs: `logs/m5_runN.log`, `logs/mission_HHMMSS.json` (per-pick aim/grasps/force/hold), `logs/api_usage.jsonl` (every Spark + Jev call). Wrist frames: `snapshots/wrist_*`.
+
+### Known problems / open work (01:15)
+- Grasps miss (gripper closes to 13.1 = air) mostly on the LEFT side of the table (weak calibration area) — run 4: 1 mined, 5 missed; run 5: Jev said "between fingers 0.85" yet closed on air. Force-feedback + regrasp search added to fix this, not yet tested on the arm.
+- grasp_ff `held` load threshold (3 %) is provisional: empty gripper settles at ~3.2 % load. Needs `grip_probe.py object` measurement.
+- Wrist-image jacobian self-calibration (2 jogs at the approach pose) failed in run 5: object not visible from the approach pose. Aim correction then falls back to the search pattern.
+- Left follower (thumbi_left, /dev/ttyFollowerRight — cables are swapped vs the original naming) is not used yet. Idea: second arm as a backstop/fence or to push objects into the well-calibrated zone. Needs its own touch calibration.
+- M6 (Glimmer local offline: needs the mmproj vision file), M7 (earth_lag + HUD), video: not done.
+
+## User requirements (log of what the user asked for, newest first — keep appending)
+- 01:10 — Grasping is not right. Add **force feedback from the gripper**: once the object is in the gripper it feels push-back, and that tells the bot the grab happened. If not, the bot should try the best way to grab without failing. Optionally bring in the **left follower arm** to assist the right one. "Don't just choose the easiest, try the hardest and get the best outcome." Look at Scale's FineART (labs.scale.com/blog/fineart: dataset + FineART-VLA, System 2 subtask reasoning / System 1 actions) for ideas so the system *ensures* the grasp happened. **Keep GitHub code and this .md updated with everything the user says, other AI models will help build.**
+- 00:45 — Use **TypeSafe Jev** (typesafe.ai, typed yes/no, ~0.4 s) as the fast judge: "is that what we want to grab? did we grab it?" Use Meta's smartest model (Muse Spark) only when needed / to cross-check Jev. Idea: Glimmer local for fast checks, Spark for high-level.
+- 00:30 — Explain how the whole pick process works (for the video).
+- 23:40 — Pick ALL the red stuff into the bin.
+- 21:40 — Push all Chand files to https://github.com/adarshbaburaj/Chand_arm.git, commits with only the user's name.
+- 21:00 — Motion must be smooth (not shaky).
+
 ## What we are building
 A SO-101 arm on the Orin "mines iron ore" (red 3D-printed shapes) into the red bin with **zero training**.
 Story: an astronaut teaches it **once** from Earth (one leader-arm demo), then the rover works alone on the Moon, fully offline.
@@ -142,3 +191,7 @@ The brain may ONLY output:
 - 2026-11-04 20:15 — Meta API found at api.meta.ai/v1; muse-spark-1.3 and muse-wonder-1.0 both return valid JSON.
 - 2026-11-04 21:50 — **M3 PASSED.** calib 11 pts affine (LOO 7.4 mm), table_z -28.1 mm. IK seeded from nearest taught pose (45° tilt). settle() integral bias fixes gravity sag (up to 10° on elbow/lift). 4/4 rocks centred in wrist cam at 35 mm hover. Next: M4 teach.py.
 - 2026-11-04 21:22 — **M4 done.** skill.json from demo_211726 + Spark rule ("red → red_bin, leave white, stop when no red"). Use `reasoning_effort="low"` + max_tokens ≥ 4000 on every Muse call (else reasoning eats all tokens, content null). Smooth motion lives in execute.py (Mover). perceive.BIN_ROI fixed box. Next: M5 execute pick-place loop.
+- 2026-11-04 21:40 — M5 runs 3/4: mined 2 then 1; gripper ramp fix (single close command was clipped to 5°).
+- 2026-11-05 00:50 — Jev layer (judge.py): target check, aim check before closing, hold check after lift, Spark tie-break. Run 5: 0 mined (aim said OK, closed on air).
+- 2026-11-05 01:15 — Force-feedback grasp (grasp_ff, Present_Load) + regrasp search (up to 3), grip_probe.py, wrist frames saved, abort no longer drives the shoulder past home. Empty-gripper probe: no false contact, settles 13.1 / 3.2 % load.
+

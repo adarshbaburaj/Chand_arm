@@ -93,6 +93,50 @@ class Mover:
             time.sleep(max(0.0, t_next - time.perf_counter()))
         self.q, self.grip = P[-1].copy(), grip
 
+    def grip_sense(self):
+        """Gripper (position deg, load %, current raw). STS3215 Present_Load: bit 10 = direction, low 10 bits =
+        0..1000 (0.1 % of max torque). This is the 'force feedback': the jaw pushing against something."""
+        b = self.f.bus
+        raw = int(b.read("Present_Load", "gripper", normalize=False))
+        load = (raw & 0x3FF) / 10.0 * (-1 if raw & 0x400 else 1)
+        cur = int(b.read("Present_Current", "gripper", normalize=False))
+        pos = float(b.read("Present_Position", "gripper"))
+        return pos, load, cur
+
+    def grasp_ff(self, close_cmd, deg_s=20.0, lag_deg=2.0, load_pct=None, squeeze=2.5, log=None):
+        """Force-feedback close: close slowly; contact = the jaw stops following the command (lag) or the
+        load rises. On contact, command only `squeeze` deg past the contact point (gentle, no squirting the
+        object out), then check the pushback. Returns dict(contact, held, pos, load, trace)."""
+        pos0, load0, _ = self.grip_sense()
+        trace, contact, cmd = [], None, pos0
+        n_hit = 0
+        while cmd > close_cmd:
+            cmd = max(close_cmd, cmd - deg_s / HZ)
+            self._send(self.q + self.bias, cmd)
+            time.sleep(1 / HZ)
+            pos, load, cur = self.grip_sense()
+            trace.append((round(cmd, 2), round(pos, 2), load, cur))
+            hit = (pos - cmd) > lag_deg or (load_pct is not None and abs(load) > load_pct)
+            n_hit = n_hit + 1 if hit else 0
+            if n_hit >= 3:
+                contact = pos
+                break
+        if contact is not None:
+            target = max(close_cmd, contact - squeeze)
+            for _ in range(int(0.6 * HZ)):
+                self._send(self.q + self.bias, target)
+                time.sleep(1 / HZ)
+            self.grip = target
+        else:
+            for _ in range(int(0.3 * HZ)):
+                self._send(self.q + self.bias, close_cmd); time.sleep(1 / HZ)
+            self.grip = close_cmd
+        pos, load, cur = self.grip_sense()
+        held = contact is not None and pos > close_cmd + 2.0 and abs(load) > 3.0   # pushback = something in the jaws
+        res = dict(contact=contact, held=held, pos=round(pos, 1), load=load, cur=cur, cmd=round(self.grip, 1), trace=trace)
+        if log is not None: log.append(res)
+        return res
+
     def gripper(self, value, wait=0.6, deg_s=60.0):
         """Ramp the gripper to `value` while holding the arm. A single command is not enough:
         max_relative_target clips every command to 5 deg from the present position."""
@@ -140,11 +184,11 @@ def line(a, b, q_seed, axis, step_mm=8.0, backwards=False):
     return path, worst
 
 
-def plan_pick(rock, skill, calib):
+def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     """Joint targets for one rock, from the demo's grasp style:
     the demo's tip offset and tool tilt are expressed relative to the rock's direction from the base and
     rotated to the new rock. Seeded from the demo grasp joints so the arm uses the same posture."""
-    x, y = rock["x_mm"], rock["y_mm"]
+    x, y = rock["x_mm"] + shift[0], rock["y_mm"] + shift[1]   # shift: visual aim correction (world mm)
     r = np.hypot(x, y)
     if not REACH_MM[0] <= r <= REACH_MM[1]:
         raise ValueError(f"rock at {r:.0f} mm from base, outside reach {REACH_MM}")
@@ -177,21 +221,85 @@ def plan_pick(rock, skill, calib):
     carry = np.vstack([q_lift, carry[k:]])
     tz = [kin.fk_xyz(q)[2] for q in carry]
     return dict(q_pre=q_pre, q_grasp=q_grasp, q_lift=q_lift, descend=descend, lift=lift, carry=carry, drop=np.array(skill["drop_q_deg"], float),
-                tip=tip.round(1).tolist(), ik_err=round(err, 1), tilt_blend=blend, carry_min_z=round(float(min(tz)), 1))
+                tip=tip.round(1).tolist(), ik_err=round(err, 1), tilt_blend=blend, carry_min_z=round(float(min(tz)), 1),
+                pre_tip=(tip - APPROACH_MM * axis), axis=axis, az=float(np.arctan2(y, x)), shift=list(shift),
+                rock=rock, calib=calib)
 
 
-def pick_place(mv, plan, skill, step=lambda name: None):
+MAX_GRASPS = 3
+
+
+def _add_shift(plan, dp):
+    az = plan["az"]
+    return (plan["shift"][0] + dp[0] * np.cos(az) - dp[1] * np.sin(az), plan["shift"][1] + dp[0] * np.sin(az) + dp[1] * np.cos(az))
+
+
+def _retreat(mv, plan):
+    """Back up along the straight descend line to q_pre (never drag the open fingers sideways at the table)."""
+    mv.follow(plan["descend"][::-1][1:], peak_deg_s=25)
+
+
+def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     """Executes a plan. step(name) is called before each phase (the mission uses it for step mode / HUD).
-    Returns dict(held=bool, grip=value)."""
+    vis (optional, see Vision) adds the camera checks: aim before closing, hold after lifting.
+    Returns dict(held=bool, grip=value, aim=[...], hold=...)."""
     g = skill["gripper"]
     g_open = g["open"] + 8          # a little wider than the demo for slack
     home = mv.q.copy()
+    out = {"aim": []}
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
+    if vis is not None and vis.jac is None:
+        step("calibrate wrist cam"); vis.calibrate(mv, plan)
     step("descend");  mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
-    step("close");    gm = mv.gripper(g["close_cmd"], wait=0.8)
-    held = gm > g["close_cmd"] + 2.0   # blocked by the rock = holding (verify)
-    print(f"  gripper cmd {g['close_cmd']} measured {gm:.1f} -> {'HOLDING' if held else 'MISSED'}", flush=True)
+    if vis is not None:
+        for k in range(3):
+            step("check aim"); a = vis.aim()
+            out["aim"].append({k2: a[k2] for k2 in ("between", "c", "w", "dp") if k2 in a})
+            if a["ok"]:
+                break
+            if a.get("dp") is None or k == 2:
+                if a["between"] < 0.3:   # sure it's not between the fingers: closing would only push it away
+                    print("  aim: object not between the fingers -> skip close (no push)", flush=True)
+                    _retreat(mv, plan); mv.gripper(g["close_cmd"] + 6, wait=0.2)
+                    mv.move(home); out.update(held=False, grip=None, reason="misaligned"); return out
+                break                    # unsure: try the grasp anyway
+            step("re-aim"); _retreat(mv, plan)
+            plan = vis.replan(plan, a["dp"])
+            mv.move(plan["q_pre"], grip=g_open)
+            mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
+    # ---- force-feedback grasp with regrasp search: close until the jaw feels the object; if it closes on air,
+    # reopen, back straight up, shift the aim (camera-guided if possible, else a small search pattern), try again
+    pattern = [(0.0, 8.0), (0.0, -8.0), (8.0, 0.0), (-8.0, 0.0)]
+    out["grasps"] = []
+    for k in range(MAX_GRASPS):
+        step("close (force feedback)")
+        ff = mv.grasp_ff(g["close_cmd"])
+        out["grasps"].append({kk: ff[kk] for kk in ("contact", "held", "pos", "load")} | {"shift": plan.get("shift")})
+        print(f"  grasp {k + 1}: contact {ff['contact']} pos {ff['pos']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", flush=True)
+        if ff["held"] or k == MAX_GRASPS - 1:
+            break
+        step("regrasp"); mv.gripper(g_open, wait=0.3)
+        dp = None
+        if vis is not None:            # look again at grasp height (reference known there), then back off
+            a = vis.aim()
+            dp = a.get("dp")
+        _retreat(mv, plan)
+        if dp is None:
+            dp = pattern[k % len(pattern)]
+        plan = vis.replan(plan, dp) if vis is not None else plan_pick(plan["rock"], skill, plan["calib"], shift=_add_shift(plan, dp))
+        mv.move(plan["q_pre"], grip=g_open)
+        mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
+    gm = ff["pos"]
+    held = ff["held"]
     step("lift");     mv.follow(plan["lift"][1:], peak_deg_s=25)
+    pos, load, _ = mv.grip_sense()                     # still pushing back after lifting = did not slip out
+    out["lifted"] = {"pos": round(pos, 1), "load": load}
+    held = held and pos > g["close_cmd"] + 2.0
+    print(f"  after lift: pos {pos:.1f} load {load} -> {'still holding' if held else 'empty'}", flush=True)
+    if vis is not None:
+        step("check hold"); h = vis.hold(held)
+        out["hold"] = h; held = h["held"]
+        print(f"  hold check: {h}", flush=True)
     if held:
         step("carry");  mv.follow(plan["carry"][1:])
         mv.move(plan["drop"], settle_s=0.5)
@@ -199,4 +307,104 @@ def pick_place(mv, plan, skill, step=lambda name: None):
     else:
         mv.gripper(g_open, wait=0.3)
     step("home");     mv.move(home, grip=g["close_cmd"] + 6)  # gripper nearly closed at rest, not squeezing
-    return dict(held=held, grip=gm)
+    out.update(held=held, grip=gm)
+    return out
+
+
+# ---------------------------------------------------------------- wrist-camera visual aim (Jev boxes)
+import json as _json  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+WRIST_CAM = "/dev/v4l/by-path/platform-3610000.usb-usb-0:4.1.3:1.0-video-index0"
+JAC_FILE = _Path(__file__).with_name("wrist_jac.json")
+JOG_MM = 15.0
+MAX_SHIFT_MM = 25.0
+
+
+class Vision:
+    """Image Jacobian between the tip's (radial, tangential) motion in mm and the red object's box centre in the
+    wrist image. Measured once by two small jogs at the approach pose (self-calibration), saved to wrist_jac.json,
+    scaled by the box width at grasp time (closer = bigger = more pixels per mm)."""
+
+    def __init__(self, skill, calib, rock, grab, on_look=lambda d: None):
+        import judge
+        self.judge, self.skill, self.calib, self.rock, self.grab, self.on_look = judge, skill, calib, rock, grab, on_look
+        self.jac = _json.loads(JAC_FILE.read_text()) if JAC_FILE.exists() else None
+
+    def _look(self, tag):
+        img = self.grab()
+        try:
+            import cv2
+            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime(f"wrist_%H%M%S_{tag}.jpg")), img)
+        except Exception:
+            pass
+        d = self.judge.wrist_look(img, tag)
+        self.on_look(d)
+        return d
+
+    def _ik_move(self, mv, tip, axis):
+        q, e = kin.ik(tip, mv.q, down=False, axis=axis)
+        if e > 3:
+            raise ValueError(f"jog IK error {e:.1f} mm")
+        mv.move(q, settle_s=0.6)
+
+    def calibrate(self, mv, plan):
+        try:
+            self._calibrate(mv, plan)
+        except Exception as e:   # camera/network trouble must never stop the pick
+            print("  wrist calibration failed (aim correction off):", e, flush=True)
+
+    def _calibrate(self, mv, plan):
+        az, axis, p0 = plan["az"], plan["axis"], np.asarray(plan["pre_tip"], float)
+        ur, ut = np.array([np.cos(az), np.sin(az), 0]), np.array([-np.sin(az), np.cos(az), 0])
+        q0 = mv.q.copy()
+        b0 = self._look("jac0")
+        try:
+            self._ik_move(mv, p0 + JOG_MM * ur, axis); b1 = self._look("jac_r")
+            self._ik_move(mv, p0 + JOG_MM * ut, axis); b2 = self._look("jac_t")
+        finally:
+            mv.move(q0, settle_s=0.6)
+        if not all(b.get("box") for b in (b0, b1, b2)):
+            print("  wrist calibration: object not visible in every view, aim correction off for this pick", flush=True)
+            return
+        J = np.column_stack([(np.subtract(b1["c"], b0["c"])) / JOG_MM, (np.subtract(b2["c"], b0["c"])) / JOG_MM])
+        if abs(np.linalg.det(J)) < 1e-5:
+            print("  wrist calibration: degenerate jacobian", np.round(J, 4), flush=True); return
+        self.jac = {"J": J.tolist(), "w_ref": b0["w"]}
+        JAC_FILE.write_text(_json.dumps(self.jac, indent=1))
+        print(f"  wrist jacobian (img/mm) {np.round(J, 4).tolist()}  box w {b0['w']:.2f}", flush=True)
+
+    def aim(self, at_pre=False):
+        try:
+            return self._aim(at_pre)
+        except Exception as e:
+            print("  aim check failed, grasping blind:", e, flush=True)
+            return {"ok": True, "between": -1}
+
+    def _aim(self, at_pre=False):
+        d = self._look("aim_pre" if at_pre else "aim")
+        d["ok"] = d["between"] >= self.judge.SURE_YES and not at_pre
+        if not d["ok"] and d.get("box") and self.jac:
+            J = np.array(self.jac["J"]) * (d["w"] / self.jac["w_ref"])
+            ref = self.jac.get("ref_pre") if at_pre else self.judge.REF_GRASP
+            if ref is None:
+                return d
+            e = np.subtract(ref, d["c"])
+            dp = 0.8 * np.linalg.solve(J, e)                 # (radial, tangential) mm
+            n = np.linalg.norm(dp)
+            if n > MAX_SHIFT_MM: dp *= MAX_SHIFT_MM / n
+            d["dp"] = dp.round(1).tolist()
+        print(f"  aim: between {d['between']:.2f} box c {np.round(d.get('c', (0, 0)), 2).tolist()} -> "
+              f"{'OK' if d['ok'] else 'shift ' + str(d.get('dp'))} ({d['s']} s)", flush=True)
+        return d
+
+    def replan(self, plan, dp):
+        return plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, dp))
+
+    def hold(self, grip_says_held):
+        try:
+            h = self.judge.held(self.grab(), grip_says_held)
+        except Exception as e:
+            h = {"held": grip_says_held, "p": -1, "src": f"servo only ({e})"}
+        self.on_look({"held": h})
+        return h
