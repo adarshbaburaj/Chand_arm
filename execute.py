@@ -6,6 +6,7 @@ kept between moves, so there are no correction jumps at the end.
 """
 import time
 import numpy as np
+import viz
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 J = [f"{j}.pos" for j in JOINTS]
@@ -46,7 +47,8 @@ def pushback(load, cur):
 
 
 class Mover:
-    def __init__(self, follower, hold=None):
+    def __init__(self, follower, hold=None, name="right"):
+        self.name = name
         self.f = follower
         self.hold = hold                 # callable -> True while paused
         self.bias = np.zeros(5)          # carried between moves
@@ -56,9 +58,12 @@ class Mover:
 
     def read(self):
         o = self.f.get_observation()
-        return np.array([o[k] for k in J])
+        q = np.array([o[k] for k in J])
+        viz.joints(self.name, q_meas=q)
+        return q
 
     def _send(self, q, grip):
+        viz.joints(self.name, q_cmd=q); viz.gripper(self.name, cmd=grip)
         self.f.send_action({**{k: float(v) for k, v in zip(J, q)}, "gripper.pos": float(grip)})
 
     def move(self, q_to, grip=None, settle_s=0.8, tol=0.6):
@@ -127,6 +132,7 @@ class Mover:
         load = (raw & 0x3FF) / 10.0 * (-1 if raw & 0x400 else 1)
         cur, _, _ = ph.read2ByteTxRx(port, 6, 69)
         pos = float(self.f.get_observation()["gripper.pos"]) if self.grip_err else float(b.read("Present_Position", "gripper"))
+        viz.gripper(self.name, pos=pos, load=load, cur=cur)
         return pos, load, int(cur)
 
     def grip_temp(self):
@@ -216,6 +222,46 @@ def line(a, b, q_seed, axis, step_mm=8.0, backwards=False):
     return path, worst
 
 
+# ---- grasp memory: per shape, the (radial, tangential) mm offset that last worked. Deep by default: run 6 showed
+# non-cube shapes ending just beyond the fingertips (arm stopped short), so start 12 mm deeper than the demo.
+MEMORY_FILE = None
+DEFAULT_RT = {"square": (0.0, 0.0), "_other": (12.0, 0.0)}
+
+
+def _mem_path():
+    from pathlib import Path
+    return Path(__file__).with_name("grasp_memory.json")
+
+
+def memory_get(shape):
+    import json
+    m = json.loads(_mem_path().read_text()) if _mem_path().exists() else {}
+    if shape in m:
+        return tuple(m[shape]["rt"]), "memory"
+    return DEFAULT_RT.get(shape, DEFAULT_RT["_other"]), "default"
+
+
+def memory_put(shape, rt, ok):
+    """Successful offsets pull the memory toward them (EMA 0.5); failures are only counted."""
+    import json
+    m = json.loads(_mem_path().read_text()) if _mem_path().exists() else {}
+    e = m.setdefault(shape, {"rt": list(DEFAULT_RT.get(shape, DEFAULT_RT["_other"])), "ok": 0, "fail": 0})
+    if ok:
+        e["rt"] = [round(0.5 * a + 0.5 * b, 1) for a, b in zip(e["rt"], rt)]
+        e["ok"] += 1
+    else:
+        e["fail"] += 1
+    _mem_path().write_text(json.dumps(m, indent=1))
+
+
+def rt_to_world(rt, az):
+    return (rt[0] * np.cos(az) - rt[1] * np.sin(az), rt[0] * np.sin(az) + rt[1] * np.cos(az))
+
+
+def world_to_rt(sh, az):
+    return (sh[0] * np.cos(az) + sh[1] * np.sin(az), -sh[0] * np.sin(az) + sh[1] * np.cos(az))
+
+
 def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     """Joint targets for one rock, from the demo's grasp style:
     the demo's tip offset and tool tilt are expressed relative to the rock's direction from the base and
@@ -271,7 +317,7 @@ def _retreat(mv, plan):
     mv.follow(plan["descend"][::-1][1:], peak_deg_s=25)
 
 
-def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
+def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None):
     """Executes a plan. step(name) is called before each phase (the mission uses it for step mode / HUD).
     vis (optional, see Vision) adds the camera checks: aim before closing, hold after lifting.
     Returns dict(held=bool, grip=value, aim=[...], hold=...)."""
@@ -310,10 +356,17 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
         step("close (force feedback)")
         ff = mv.grasp_ff(GRIP_CLOSED)
         out["grasps"].append({kk: ff[kk] for kk in ("contact", "held", "pos", "load")} | {"shift": plan.get("shift")})
+        viz.text(f"grasp {k + 1}: contact {ff['contact']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}",
+                 "INFO" if ff["held"] else "WARN")
         print(f"  grasp {k + 1}: contact {ff['contact']} pos {ff['pos']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", flush=True)
         if ff["held"] or k == MAX_GRASPS - 1:
             break
         step("regrasp"); mv.gripper(g_open, wait=0.3)
+        if assist is not None and not out.get("assisted"):
+            # two-arm: right gripper stays open at the grasp pose, the left arm slides the object into the jaws
+            step("left arm push"); out["assisted"] = bool(assist(plan))
+            if out["assisted"]:
+                continue                       # close again right here, no re-aim
         dp = pattern[k % len(pattern)]
         if vis is not None:            # look again at grasp height: which way is the object?
             w = vis.where()
@@ -340,7 +393,7 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     if vis is not None and not (not held and pos < GRIP_CLOSED + 3.0):   # jaws fully shut = surely empty, no need to ask
         step("check hold"); h = vis.hold(held)
         out["hold"] = h; held = h["held"]
-        print(f"  hold check: {h}", flush=True)
+        print(f"  hold check: {h}", flush=True); viz.text(f"hold check: {h}")
     if held:
         step("carry");  mv.follow(plan["carry"][1:])
         mv.move(plan["drop"], settle_s=0.5)
@@ -348,7 +401,7 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     else:
         mv.gripper(g_open, wait=0.3)
     step("home");     mv.move(home, grip=g["close_cmd"] + 6)  # gripper nearly closed at rest, not squeezing
-    out.update(held=held, grip=gm)
+    out.update(held=held, grip=gm, shift_rt=[round(float(v), 1) for v in world_to_rt(plan["shift"], plan["az"])])
     return out
 
 
@@ -381,6 +434,9 @@ class Vision:
         except Exception:
             pass
         d = self.judge.wrist_look(img, tag)
+        viz.image("ai/wrist_checked", img)
+        viz.text(f"jev {tag}: between {d['between']:.2f} box {d.get('c')}")
+        viz.value("ai/jev_between", d["between"])
         self.on_look(d)
         return d
 
@@ -451,6 +507,7 @@ class Vision:
             w = self.judge.where(img)
         except Exception as e:
             print("  where check failed:", e, flush=True); return {"choice": None, "p": {}}
+        viz.image("ai/wrist_checked", img); viz.text(f"jev where: {w['choice']} {w['p']}")
         print(f"  where: {w['choice']} {({k: round(v, 2) for k, v in w['p'].items()})} ({w['s']} s)", flush=True)
         self.on_look({"between": w["p"].get("between", 0), "s": w["s"]})
         return w

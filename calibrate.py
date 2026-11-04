@@ -16,9 +16,14 @@ from execute import Mover
 import tkinter as tk
 from PIL import Image, ImageTk
 
-FOLLOWER_PORT, LEADER_PORT, ARM_ID = "/dev/ttyFollowerLeft", "/dev/ttyLeaderRight", "thumbi_right"
+# Arms (cables are swapped vs the original naming: the RIGHT follower sits on /dev/ttyFollowerLeft).
+# --arm left: the RIGHT leader (only leader plugged in) drives the LEFT follower; same joint layout, so a direct copy.
+ARM = "left" if "--arm" in sys.argv and sys.argv[sys.argv.index("--arm") + 1] == "left" else "right"
+FOLLOWER_PORT = {"right": "/dev/ttyFollowerLeft", "left": "/dev/ttyFollowerRight"}[ARM]
+ARM_ID = f"thumbi_{ARM}"                                     # follower calibration id
+LEADER_PORT, LEADER_ID = "/dev/ttyLeaderRight", "thumbi_right"
 J = [f"{j}.pos" for j in kin.JOINTS]
-PTS_FILE, CALIB_FILE = "calib_points.json", "calib.json"
+PTS_FILE, CALIB_FILE = ("calib_points.json", "calib.json") if ARM == "right" else ("calib_points_left.json", "calib_left.json")
 
 
 def _affine(px, mm):  # 2x3, px -> mm. Beat the homography on leave-one-out (7.4 vs 8.6 mm, 11 pts)
@@ -45,11 +50,12 @@ def main():
     except Exception:
         pass
     follower = SOFollower(SOFollowerRobotConfig(port=FOLLOWER_PORT, id=ARM_ID, max_relative_target=5.0))
-    leader = SOLeader(SOLeaderTeleopConfig(port=LEADER_PORT, id=ARM_ID))
+    leader = SOLeader(SOLeaderTeleopConfig(port=LEADER_PORT, id=LEADER_ID))
     follower.connect(calibrate=False); leader.connect(calibrate=False)
+    print(f"calibrating the {ARM.upper()} follower ({FOLLOWER_PORT}, id {ARM_ID}) with the right leader -> {CALIB_FILE}", flush=True)
     cam = cv2.VideoCapture(perceive.TOP_CAM, cv2.CAP_V4L2)
     cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")); cam.set(3, 640); cam.set(4, 480)
-    root = tk.Tk(); root.title("chand calibrate"); panel = tk.Label(root); panel.pack()
+    root = tk.Tk(); root.title(f"chand calibrate {ARM} arm"); panel = tk.Label(root); panel.pack()
     keys = []
     root.bind("<Key>", lambda e: keys.append(e.char.lower() if e.char else ""))
     root.protocol("WM_DELETE_WINDOW", lambda: keys.append("q"))

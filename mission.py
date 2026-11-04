@@ -29,7 +29,7 @@ if "--offline" in ARGS:
     socket.socket.connect = _guard
 
 import cv2
-import kin, perceive, brain, execute, judge
+import kin, perceive, brain, execute, judge, cams, viz
 from execute import Mover
 
 FOLLOWER_PORT, ARM_ID = "/dev/ttyFollowerLeft", "thumbi_right"
@@ -39,23 +39,48 @@ def _fails(r, history):
     return sum(1 for h in history if h["result"] != "mined" and np.hypot(h["at"][0] - r["x_mm"], h["at"][1] - r["y_mm"]) < 30)
 
 
+_ORDER = []   # positions (mm) of the objects in the order Spark planned; ids change between frames, positions don't
+
+
+def _match(pos, rocks, allowed):
+    for r in rocks:
+        if r["id"] in allowed and np.hypot(r["x_mm"] - pos[0], r["y_mm"] - pos[1]) < 30:
+            return r
+    return None
+
+
 def plan_next(rule, rocks, history):
-    """Brain: pick the next rock. Strict JSON check, one retry, then the plain rule.
-    A rock that failed twice (or that Jev said is not a target) is not offered again."""
+    """Brain. Muse Spark plans the ORDER of all target objects once (one ~5-10 s call per mission instead of one per
+    pick); the plan is reused while picks succeed and asked again after a failure or a surprise.
+    Strict JSON check, one retry, then the plain rule. Failed-twice / not-a-target objects are never offered."""
+    global _ORDER
     allowed = [r["id"] for r in rocks if r["colour"] == rule["pick"]["colour"] and _fails(r, history) < 2
                and not any(h["result"].startswith("not a target") and np.hypot(h["at"][0] - r["x_mm"], h["at"][1] - r["y_mm"]) < 30 for h in history)]
     if not allowed:
         return {"skill": "done", "why": "no target colour left"}, "rule"
+    last_ok = not history or history[-1]["result"] == "mined"
+    if BACKEND != "rule" and last_ok:
+        while _ORDER:
+            r = _match(_ORDER[0], rocks, allowed)
+            if r is not None:
+                return {"skill": "pick", "obj": r["id"], "why": "next in Spark's plan"}, "plan (cached)"
+            _ORDER.pop(0)                                   # already mined or moved: drop it
     if BACKEND == "rule":
         r = min((r for r in rocks if r["id"] in allowed), key=lambda r: np.hypot(r["x_mm"], r["y_mm"]))
         return {"skill": "pick", "obj": r["id"], "why": "nearest first"}, "rule"
     sys_p = ("You are the planner of a mining rover arm. Rule from the operator: " + rule["rule_text"] +
-             ' Reply with ONLY one JSON object, either {"skill":"pick","obj":"<id>","why":"<short>"} or '
-             '{"skill":"done","why":"<short>"}. Choose an object that the rule says to pick. Prefer one that is '
-             "easy and safe to reach (not too far, not next to other objects). If the last attempt on an object failed, "
-             "prefer a different object next.")
-    user = json.dumps({"objects_on_table_mm": [{k: r[k] for k in ("id", "colour", "x_mm", "y_mm")} for r in rocks if r["id"] in allowed],
+             ' Reply with ONLY one JSON object: {"skill":"plan","order":["<id>", ...],"why":"<short>"} listing EVERY '
+             'object the rule says to pick, best first, or {"skill":"done","why":"<short>"}. Put easy, safe, well-'
+             "reachable objects first; shapes with more past failures later. After a failed attempt, start with a "
+             "different object than the one that failed.")
+    mem = {}
+    try:
+        mem = json.loads((HERE / "grasp_memory.json").read_text())
+    except Exception:
+        pass
+    user = json.dumps({"objects_on_table_mm": [{k: r.get(k) for k in ("id", "colour", "shape", "x_mm", "y_mm")} for r in rocks if r["id"] in allowed],
                        "arm_base_at": [0, 0], "reach_mm": execute.REACH_MM, "bin": "red_bin",
+                       "grasp_record_by_shape": {k: {"ok": v["ok"], "fail": v["fail"]} for k, v in mem.items()},
                        "already_tried": history[-4:]})
     for attempt in range(2):
         try:
@@ -63,9 +88,15 @@ def plan_next(rule, rocks, history):
             reply = brain.chat([{"role": "system", "content": sys_p}, {"role": "user", "content": user}],
                                backend=BACKEND, tag="plan", reasoning_effort="low")
             d = brain.parse_json(reply)
-            if d.get("skill") == "done" or (d.get("skill") == "pick" and d.get("obj") in allowed):
+            if d.get("skill") == "done":
                 return d, f"{BACKEND} {time.time() - t0:.1f}s"
-            print("  brain gave an invalid choice:", d, flush=True)
+            order = [o for o in d.get("order", []) if o in allowed]
+            if d.get("skill") == "plan" and order:
+                by_id = {r["id"]: r for r in rocks}
+                _ORDER = [(by_id[o]["x_mm"], by_id[o]["y_mm"]) for o in order]
+                return ({"skill": "pick", "obj": order[0], "why": d.get("why", ""), "plan": order},
+                        f"{BACKEND} {time.time() - t0:.1f}s")
+            print("  brain gave an invalid plan:", d, flush=True)
         except Exception as e:
             print("  brain error:", e, flush=True)
     r = min((r for r in rocks if r["id"] in allowed), key=lambda r: np.hypot(r["x_mm"], r["y_mm"]))
@@ -112,6 +143,11 @@ def main():
                 show(f"STEP MODE: SPACE to do '{name}'"); time.sleep(0.05)
         show()
 
+    if "--no-viz" not in ARGS:
+        viz.start()                       # viewer first (see viz.start)
+    cam = cams.Cams.start()
+    print("cameras on:", list(cam.cams), flush=True)
+    viz.stream(cam)
     follower = SOFollower(SOFollowerRobotConfig(port=FOLLOWER_PORT, id=ARM_ID, max_relative_target=5.0))
     follower.connect(calibrate=False)
     print("gripper boost", execute.boost_gripper(follower), flush=True)
@@ -128,11 +164,12 @@ def main():
             info["phase"] = "look"; show()
             frame = perceive.grab()                     # arm is home = out of view
             rocks, _ = perceive.scene(frame, calib)
-            cv2.imwrite(str(HERE / "snapshots" / f"mission_{n}.jpg"), perceive.draw(frame, *perceive.detect(frame)))
+            drawn = perceive.draw(frame, *perceive.detect(frame))
+            cv2.imwrite(str(HERE / "snapshots" / f"mission_{n}.jpg"), drawn); viz.image("ai/top_detections", drawn)
             info["phase"] = "think"; show()
             d, src = plan_next(rule, rocks, history)
             info["brain"] = f"{src}: {json.dumps(d)}"
-            print(f"[{n}] {len(rocks)} red seen -> {src}: {d}", flush=True)
+            print(f"[{n}] {len(rocks)} red seen -> {src}: {d}", flush=True); viz.text(f"[{n}] brain {src}: {d}")
             if d["skill"] == "done":
                 break
             rock = next(r for r in rocks if r["id"] == d["obj"])
@@ -147,8 +184,10 @@ def main():
                         continue
                 except Exception as e:
                     print("  jev target check failed (ignored):", e, flush=True)
+            rt, rt_src = execute.memory_get(rock.get("shape", "_other"))
+            print(f"  shape {rock.get('shape')} -> start offset {rt} mm (radial, tangential) from {rt_src}", flush=True)
             try:
-                plan = execute.plan_pick(rock, skill, calib)
+                plan = execute.plan_pick(rock, skill, calib, shift=execute.rt_to_world(rt, np.arctan2(rock["y_mm"], rock["x_mm"])))
             except ValueError as e:
                 print("  cannot plan:", e, flush=True); history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": f"unreachable: {e}"}); continue
             try:
@@ -171,13 +210,15 @@ def main():
             after, _ = perceive.scene(perceive.grab(), calib)
             still = any(np.hypot(r["x_mm"] - rock["x_mm"], r["y_mm"] - rock["y_mm"]) < 25 for r in after)
             ok = res["held"] and not still
+            if res.get("reason") != "object lost":
+                execute.memory_put(rock.get("shape", "_other"), res.get("shift_rt", rt), ok)
             info["mined"] += int(ok)
             result = "mined" if ok else (res.get("reason") or ("missed grasp" if not res["held"] else "rock still on table"))
             history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": result})
             log.append({"n": n, "rock": rock, "brain": d, "src": src, "held": res["held"], "grip": res["grip"], "result": result,
                         "aim": res.get("aim"), "hold": res.get("hold"), "grasps": res.get("grasps"), "lifted": res.get("lifted"),
                         "t": round(time.time() - info["t0"], 1)})
-            print(f"  -> {result}", flush=True)
+            print(f"  -> {result}", flush=True); viz.text(f"-> {result}", "INFO" if ok else "WARN"); viz.value("mission/mined", info["mined"])
     finally:
         info["phase"] = "home"; show()
         try:
@@ -189,6 +230,7 @@ def main():
             try: root.destroy()
             except Exception: pass
             follower.disconnect()
+            cam.stop()
 
 
 if __name__ == "__main__":

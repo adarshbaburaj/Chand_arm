@@ -11,6 +11,10 @@ BIN_ROI = (465, 20, 640, 200)  # x0,y0,x1,y1 px of the red bin in the top cam. N
 
 
 def grab(path=TOP_CAM, warm=15):
+    import cams   # always-on cameras (mission): fresh frame from the running thread, no device re-open
+    name = cams.by_path(path)
+    if name:
+        return cams.active().fresh(name)
     c = cv2.VideoCapture(path, cv2.CAP_V4L2)
     c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     c.set(3, 640); c.set(4, 480)
@@ -30,6 +34,14 @@ def red_mask(img):
     return cv2.morphologyEx(cv2.morphologyEx(m, cv2.MORPH_OPEN, k), cv2.MORPH_CLOSE, k)
 
 
+def shape_of(c, w, h):
+    """Rough shape class from the top view (used as the key of the grasp memory)."""
+    if max(w, h) / max(1.0, min(w, h)) > 1.6:
+        return "long"            # e.g. a cylinder lying down
+    n = len(cv2.approxPolyDP(c, 0.04 * cv2.arcLength(c, True), True))
+    return {4: "square", 5: "pentagon", 6: "hexagon"}.get(n, "round" if n > 6 else f"poly{n}")
+
+
 def detect(img):
     objs = []
     cnts, _ = cv2.findContours(red_mask(img), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -43,7 +55,7 @@ def detect(img):
         if x0 <= cx <= x1 and y0 <= cy <= y1:
             continue
         objs.append({"id": f"red_{len(objs)}", "colour": "red", "u": round(cx), "v": round(cy),
-                     "angle_deg": round(ang, 1), "size_px": round(max(w, h)), "contour": c})
+                     "angle_deg": round(ang, 1), "size_px": round(max(w, h)), "contour": c, "shape": shape_of(c, w, h)})
     return objs, bin_box
 
 
@@ -84,7 +96,7 @@ def scene(img, calib):
     for o in objs:
         x, y = to_mm(o["u"], o["v"], calib)
         out.append({"id": o["id"], "colour": o["colour"], "x_mm": round(x), "y_mm": round(y),
-                    "angle_deg": o["angle_deg"], "u": o["u"], "v": o["v"]})
+                    "angle_deg": o["angle_deg"], "u": o["u"], "v": o["v"], "shape": o["shape"]})
     b = None
     if bin_box:
         bx, by, bw, bh = bin_box
