@@ -280,8 +280,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     home = mv.q.copy()
     out = {"aim": []}
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
-    if vis is not None and vis.jac is None:
+    if vis is not None and vis.jac is None and not Vision.calib_failed:
         step("calibrate wrist cam"); vis.calibrate(mv, plan)
+        Vision.calib_failed = vis.jac is None     # don't waste ~6 s per pick retrying
     step("descend");  mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
     if vis is not None:
         for k in range(3):
@@ -301,7 +302,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
             mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
     # ---- force-feedback grasp with regrasp search: close until the jaw feels the object; if it closes on air,
     # reopen, back straight up, shift the aim (camera-guided if possible, else a small search pattern), try again
-    pattern = [(0.0, 8.0), (0.0, -8.0), (8.0, 0.0), (-8.0, 0.0)]
+    # run 6: wrist cam showed the object just BEYOND the fingertips (arm stopped short) -> search deeper first
+    pattern = [(12.0, 0.0), (12.0, 0.0), (-24.0, 8.0), (0.0, -16.0)]   # (radial, tangential) mm, cumulative shifts
+    tang = [(0.0, 8.0), (0.0, -16.0)]
     out["grasps"] = []
     for k in range(MAX_GRASPS):
         step("close (force feedback)")
@@ -311,13 +314,19 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
         if ff["held"] or k == MAX_GRASPS - 1:
             break
         step("regrasp"); mv.gripper(g_open, wait=0.3)
-        dp = None
-        if vis is not None:            # look again at grasp height (reference known there), then back off
-            a = vis.aim()
-            dp = a.get("dp")
+        dp = pattern[k % len(pattern)]
+        if vis is not None:            # look again at grasp height: which way is the object?
+            w = vis.where()
+            out.setdefault("where", []).append(w)
+            if w.get("choice") == "none" and w["p"].get("none", 0) > 0.7:
+                print("  object no longer near the fingers (pushed away?) -> give up on this one", flush=True)
+                _retreat(mv, plan); mv.move(home, grip=g["close_cmd"] + 6)
+                out.update(held=False, grip=ff["pos"], reason="object lost"); return out
+            if w["p"].get("beyond", 0) > 0.8:
+                dp = (12.0, 0.0)                      # deeper, accumulates with earlier shifts
+            elif w.get("choice") in ("left", "right"):
+                dp = tang[k % 2]
         _retreat(mv, plan)
-        if dp is None:
-            dp = pattern[k % len(pattern)]
         plan = vis.replan(plan, dp) if vis is not None else plan_pick(plan["rock"], skill, plan["calib"], shift=_add_shift(plan, dp))
         mv.move(plan["q_pre"], grip=g_open)
         mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
@@ -328,7 +337,7 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None):
     out["lifted"] = {"pos": round(pos, 1), "load": load, "cur": cur}
     held = held and pos > GRIP_CLOSED + 2.0 and pushback(load, cur)
     print(f"  after lift: pos {pos:.1f} load {load} -> {'still holding' if held else 'empty'}", flush=True)
-    if vis is not None:
+    if vis is not None and not (not held and pos < GRIP_CLOSED + 3.0):   # jaws fully shut = surely empty, no need to ask
         step("check hold"); h = vis.hold(held)
         out["hold"] = h; held = h["held"]
         print(f"  hold check: {h}", flush=True)
@@ -354,6 +363,7 @@ MAX_SHIFT_MM = 25.0
 
 
 class Vision:
+    calib_failed = False
     """Image Jacobian between the tip's (radial, tangential) motion in mm and the red object's box centre in the
     wrist image. Measured once by two small jogs at the approach pose (self-calibration), saved to wrist_jac.json,
     scaled by the box width at grasp time (closer = bigger = more pixels per mm)."""
@@ -432,6 +442,18 @@ class Vision:
 
     def replan(self, plan, dp):
         return plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, dp))
+
+    def where(self):
+        img = self.grab()
+        try:
+            import cv2
+            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime("wrist_%H%M%S_where.jpg")), img)
+            w = self.judge.where(img)
+        except Exception as e:
+            print("  where check failed:", e, flush=True); return {"choice": None, "p": {}}
+        print(f"  where: {w['choice']} {({k: round(v, 2) for k, v in w['p'].items()})} ({w['s']} s)", flush=True)
+        self.on_look({"between": w["p"].get("between", 0), "s": w["s"]})
+        return w
 
     def hold(self, grip_says_held):
         try:

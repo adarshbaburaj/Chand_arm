@@ -82,6 +82,27 @@ def wrist_look(img, tag="wrist"):
     return out
 
 
+WHERE_Q = {"where": {"type": "choice", "instructions": "Wrist camera of an open robot gripper about to close. The two white "
+                     "fingers with rubber bands at their tips are at the bottom-left and bottom-right. Where is the red object "
+                     "relative to the fingers?",
+                     "criteria": {"between": "The red object sits down between the two fingers, level with the rubber-band tips "
+                                             "or closer to the camera; closing would grip it.",
+                                  "beyond": "The red object is further away than the fingertips: it appears above the "
+                                            "rubber-band tips in the image, so the gripper must move forward.",
+                                  "left": "The red object is mostly left of the gap between the fingers.",
+                                  "right": "The red object is mostly right of the gap between the fingers.",
+                                  "none": "No red object near the fingers."}}}
+
+
+def where(img, tag="where"):
+    """After a grasp closed on air: which way is the object? (choice + probabilities). Biased toward 'beyond'
+    (even good grasps score ~0.6 beyond), so callers compare against the miss pattern, not argmax alone."""
+    a = ask("Wrist camera image: IMG1", WHERE_Q, img, tag)["where"]
+    out = {"choice": a.get("choice"), "p": a.get("probabilities") or {}, "s": a["_s"]}
+    last["where"] = out
+    return out
+
+
 HELD_Q = {"held": {"type": "noul",
                    "instructions": "The gripper is holding a red object: it is pinched between the two white gripper "
                                    "fingers, close to the camera, lifted off the table.",
