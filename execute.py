@@ -274,7 +274,7 @@ def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     off = _rotz(skill["grasp"]["offset_from_rock_top_mm"], d_az)
     axis0 = _rotz(skill["grasp"]["tool_z"], d_az)
     tip = np.array([x, y, calib["rock_top_z_mm"]]) + off
-    seed = np.array(skill["grasp"]["q_deg"], float); seed[0] += np.rad2deg(d_az)
+    seed = np.array(skill["grasp"]["q_deg"], float); seed[0] -= np.rad2deg(d_az)   # pan = -azimuth (checked with FK)
     # demo tilt first; near the base that pins the elbow at its limit, so try steeper (more vertical) tilts
     for blend in (0.0, 0.25, 0.5, 0.75):
         axis = (1 - blend) * axis0 + blend * np.array([0, 0, -1.0]); axis /= np.linalg.norm(axis)
@@ -317,7 +317,7 @@ def _retreat(mv, plan):
     mv.follow(plan["descend"][::-1][1:], peak_deg_s=25)
 
 
-def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None):
+def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, place=None):
     """Executes a plan. step(name) is called before each phase (the mission uses it for step mode / HUD).
     vis (optional, see Vision) adds the camera checks: aim before closing, hold after lifting.
     Returns dict(held=bool, grip=value, aim=[...], hold=...)."""
@@ -394,7 +394,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None):
         step("check hold"); h = vis.hold(held)
         out["hold"] = h; held = h["held"]
         print(f"  hold check: {h}", flush=True); viz.text(f"hold check: {h}")
-    if held:
+    if held and place is not None:     # e.g. the left arm putting the object down at the handoff spot
+        place(mv, plan)
+    elif held:
         step("carry");  mv.follow(plan["carry"][1:])
         mv.move(plan["drop"], settle_s=0.5)
         step("drop");   mv.gripper(g_open, wait=0.6)

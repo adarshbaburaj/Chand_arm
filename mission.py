@@ -16,6 +16,7 @@ ARGS = sys.argv[1:]
 BACKEND = ARGS[ARGS.index("--backend") + 1] if "--backend" in ARGS else "meta_api"
 STEP = "--step" in ARGS
 JUDGE = "--no-judge" not in ARGS and "--offline" not in ARGS
+TWO_ARM = "--one-arm" not in ARGS and (HERE / "calib_left.json").exists() and Path("/dev/ttyFollowerRight").exists()
 MAX_PICKS = int(ARGS[ARGS.index("--max-picks") + 1]) if "--max-picks" in ARGS else 8
 
 if "--offline" in ARGS:
@@ -29,7 +30,7 @@ if "--offline" in ARGS:
     socket.socket.connect = _guard
 
 import cv2
-import kin, perceive, brain, execute, judge, cams, viz
+import kin, perceive, brain, execute, judge, cams, viz, two_arm, assist
 from execute import Mover
 
 FOLLOWER_PORT, ARM_ID = "/dev/ttyFollowerLeft", "thumbi_right"
@@ -78,7 +79,10 @@ def plan_next(rule, rocks, history):
         mem = json.loads((HERE / "grasp_memory.json").read_text())
     except Exception:
         pass
-    user = json.dumps({"objects_on_table_mm": [{k: r.get(k) for k in ("id", "colour", "shape", "x_mm", "y_mm")} for r in rocks if r["id"] in allowed],
+    user = json.dumps({"objects_on_table_mm": [{k: r.get(k) for k in ("id", "colour", "shape", "x_mm", "y_mm", "arm")} for r in rocks if r["id"] in allowed],
+                       "arms": "two arms. 'arm' says who can reach each object: right = picks straight into the bin; "
+                               "left = the left arm first moves it next to the right arm, then the right arm bins it "
+                               "(slower, so put left-only objects last).",
                        "arm_base_at": [0, 0], "reach_mm": execute.REACH_MM, "bin": "red_bin",
                        "grasp_record_by_shape": {k: {"ok": v["ok"], "fail": v["fail"]} for k, v in mem.items()},
                        "already_tried": history[-4:]})
@@ -153,6 +157,18 @@ def main():
     print("gripper boost", execute.boost_gripper(follower), flush=True)
     mv = Mover(follower, hold)
     home = mv.q.copy()
+    mvL, homeL, spot = None, None, None
+    if TWO_ARM:
+        try:
+            fL = SOFollower(SOFollowerRobotConfig(port=two_arm.LEFT_PORT, id=two_arm.LEFT_ID, max_relative_target=5.0))
+            fL.connect(calibrate=False)
+            execute.boost_gripper(fL)
+            mvL = Mover(fL, hold, name="left"); homeL = mvL.q.copy()
+            spot = two_arm.handoff_spot(skill)
+            R2L, tzL = assist.frames()
+            print(f"two-arm mode: left follower on, handoff spot px {spot}", flush=True); viz.text(f"two-arm mode, handoff spot {spot}")
+        except Exception as e:
+            print("two-arm mode OFF:", e, flush=True); mvL = None
     history, log = [], []
     show("SPACE to start the mission")
     while st["pause"] and not st["quit"]:
@@ -166,6 +182,18 @@ def main():
             rocks, _ = perceive.scene(frame, calib)
             drawn = perceive.draw(frame, *perceive.detect(frame))
             cv2.imwrite(str(HERE / "snapshots" / f"mission_{n}.jpg"), drawn); viz.image("ai/top_detections", drawn)
+            for r in rocks:     # who can reach it (painted workspace + a real grasp plan)
+                if two_arm.can_pick("right", r["u"], r["v"], skill)[0]:
+                    r["arm"] = "right"
+                elif mvL is not None and two_arm.can_pick("left", r["u"], r["v"], skill)[0]:
+                    r["arm"] = "left"
+                else:
+                    r["arm"] = "none"
+            for r in [r for r in rocks if r["arm"] == "none"]:
+                if not any(h["result"] == "unreachable by both arms" and np.hypot(h["at"][0] - r["x_mm"], h["at"][1] - r["y_mm"]) < 30 for h in history):
+                    history.append({"obj": r["id"], "at": [r["x_mm"], r["y_mm"]], "result": "unreachable by both arms"})
+                    print(f"  {r['id']} at {r['x_mm'], r['y_mm']} mm: no arm can reach it", flush=True)
+            rocks = [r for r in rocks if r["arm"] != "none"]
             info["phase"] = "think"; show()
             d, src = plan_next(rule, rocks, history)
             info["brain"] = f"{src}: {json.dumps(d)}"
@@ -173,7 +201,7 @@ def main():
             if d["skill"] == "done":
                 break
             rock = next(r for r in rocks if r["id"] == d["obj"])
-            info["target"] = f'{rock["id"]} ({rock["x_mm"]},{rock["y_mm"]}) mm'
+            info["target"] = f'{rock["id"]} {rock.get("shape")} ({rock["x_mm"]},{rock["y_mm"]}) mm -> {rock["arm"]} arm'
             if JUDGE:
                 try:
                     p = judge.is_target(frame, rock, rule["rule_text"])
@@ -186,6 +214,26 @@ def main():
                     print("  jev target check failed (ignored):", e, flush=True)
             rt, rt_src = execute.memory_get(rock.get("shape", "_other"))
             print(f"  shape {rock.get('shape')} -> start offset {rt} mm (radial, tangential) from {rt_src}", flush=True)
+            if rock["arm"] == "left":
+                print(f"  right arm can't reach it: LEFT arm picks it and puts it at the handoff spot {spot}", flush=True)
+                viz.text(f"{rock['id']}: left arm hands it over to the right arm")
+                try:
+                    xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
+                    visL = None
+                    if JUDGE:
+                        visL = execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL}, lambda: cam.fresh("left_wrist"),
+                                              lambda d: None) if "left_wrist" in cam.cams else None
+                    res = two_arm.left_handoff(mvL, (rock["u"], rock["v"]), skill, spot, step, vis=visL, shift_rt=rt)
+                except KeyboardInterrupt:
+                    print("  aborted: left arm opening + home", flush=True)
+                    mvL.gripper(skill["gripper"]["open"] + 8, wait=0.3); mvL.move(homeL); break
+                except ValueError as e:
+                    res = {"held": False, "reason": f"left cannot plan: {e}"}
+                result = "handed to the right arm" if res.get("held") else ("left: " + (res.get("reason") or "missed grasp"))
+                history.append({"obj": rock["id"], "at": [rock["x_mm"], rock["y_mm"]], "result": result})
+                log.append({"n": n, "rock": rock, "arm": "left", "result": result, "grasps": res.get("grasps"), "t": round(time.time() - info["t0"], 1)})
+                print(f"  -> {result}", flush=True); viz.text(f"-> {result}")
+                continue
             try:
                 plan = execute.plan_pick(rock, skill, calib, shift=execute.rt_to_world(rt, np.arctan2(rock["y_mm"], rock["x_mm"])))
             except ValueError as e:
@@ -198,7 +246,18 @@ def main():
                         else: info["judge"] = f"aim: between {d['between']:.2f}  box {np.round(d.get('c', (0, 0)), 2).tolist()}  {d['s']} s"
                         show()
                     vis = execute.Vision(skill, calib, rock, lambda: perceive.grab(execute.WRIST_CAM, warm=8), on_look)
-                res = execute.pick_place(mv, plan, skill, step, vis=vis)
+                push = None
+                if mvL is not None:
+                    def push(plan_r, rock=rock):
+                        try:
+                            pp = assist.plan_push((rock["x_mm"], rock["y_mm"]), plan_r["tip"], mvL.q, R2L, tzL)
+                        except Exception as e:
+                            print("  left push: cannot plan:", e, flush=True); return False
+                        if pp["err"] > 6:
+                            print(f"  left push: out of reach (IK err {pp['err']} mm)", flush=True); return False
+                        print(f"  LEFT ARM PUSH: {pp['push_mm']} mm toward the right gripper", flush=True); viz.text("left arm pushes object into right gripper")
+                        assist.do_push(mvL, pp, homeL); return True
+                res = execute.pick_place(mv, plan, skill, step, vis=vis, assist=push)
             except KeyboardInterrupt:
                 print("  aborted: opening gripper, going home", flush=True)
                 mv.gripper(skill["gripper"]["open"] + 8, wait=0.3)
@@ -225,6 +284,12 @@ def main():
             if np.abs(mv.read() - home).max() > 3:
                 st["pause"] = False; mv.move(home)
         finally:
+            if mvL is not None:
+                try:
+                    if np.abs(mvL.read() - homeL).max() > 3: mvL.move(homeL)
+                    mvL.f.disconnect()
+                except Exception as e:
+                    print("left arm shutdown:", e, flush=True)
             json.dump(log, open(HERE / "logs" / time.strftime("mission_%H%M%S.json"), "w"), indent=1)
             print(f"MISSION END: mined {info['mined']} in {time.time() - (info['t0'] or time.time()):.0f}s", flush=True)
             try: root.destroy()
