@@ -4,6 +4,8 @@ Created 2026-11-04 18:58 Dubai. **Submit by 05:30 Dubai on 2026-11-05 (hard dead
 This is a side project, separate from the Malta challenge. Malta context lives in `~/SO101_handoff.md`.
 Project folder: `~/chand/`. All new code goes here. Nothing in `~/so101_*` or `~/workspaces/lerobot_v061` gets edited.
 
+**Next-version design (two arms, progress monitor, VLA/FineART data path): see `PLAN_V2.md`.**
+
 ## FOR ANY AI ASSISTANT PICKING THIS UP (kept current, 2026-11-05 01:15 Dubai)
 Several AI assistants help build this. Read this section, then `## User requirements`, then the code. Run everything in
 `source ~/workspaces/lerobot_v061_env/bin/activate` (torch 2.11.0 + CUDA must stay; check `python -c "import torch;print(torch.__version__, torch.cuda.is_available())"` before/after any install).
@@ -46,6 +48,7 @@ Low-level control is NEVER an AI model (needs 50 Hz). Models decide what/whether
 - M6 (Glimmer local offline: needs the mmproj vision file), M7 (earth_lag + HUD), video: not done.
 
 ## User requirements (log of what the user asked for, newest first — keep appending)
+- 01:30 — Hackathon video already recorded (one arm, pick + drop) → now build **as ambitious as possible**. Use Scale's FineART data to make the bot smarter; copy the "π0.5 VLA + planner where the policy predicts task progress and the planner executes the next step" pattern; reuse the VLAs already on disk; **left follower will be connected ~50 cm from the right follower**; use the APIs and logic properly; write ONE best design to a .md for review with ChatGPT → **`PLAN_V2.md`**. Set up `gh` login so tokens are never pasted again.
 - 01:10 — Grasping is not right. Add **force feedback from the gripper**: once the object is in the gripper it feels push-back, and that tells the bot the grab happened. If not, the bot should try the best way to grab without failing. Optionally bring in the **left follower arm** to assist the right one. "Don't just choose the easiest, try the hardest and get the best outcome." Look at Scale's FineART (labs.scale.com/blog/fineart: dataset + FineART-VLA, System 2 subtask reasoning / System 1 actions) for ideas so the system *ensures* the grasp happened. **Keep GitHub code and this .md updated with everything the user says, other AI models will help build.**
 - 00:45 — Use **TypeSafe Jev** (typesafe.ai, typed yes/no, ~0.4 s) as the fast judge: "is that what we want to grab? did we grab it?" Use Meta's smartest model (Muse Spark) only when needed / to cross-check Jev. Idea: Glimmer local for fast checks, Spark for high-level.
 - 00:30 — Explain how the whole pick process works (for the video).
