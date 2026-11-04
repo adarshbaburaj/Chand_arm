@@ -247,6 +247,7 @@ def main():
         extra = {"shape": rock.get("shape"), "axis_px": rock.get("axis_px")}
         vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL, **extra}, lambda: cam.fresh("left_wrist"),
                               lambda d: None, arm="left") if JUDGE and "left_wrist" in cam.cams else None)
+        if vis is not None: vis.peek = lambda: cam.latest("left_wrist")
         held_zone = {}
         try:
             res = two_arm.left_handoff(mv, (rock["u"], rock["v"]), skill, spot, step, vis=vis, shift_rt=rt,
@@ -291,6 +292,7 @@ def main():
                 ZONE.release(); zone_held["yes"] = False          # never hold the shared area while the left works
             base_step(name)
         vis = execute.Vision(skill, calib, rock, lambda: cam.fresh("right_wrist"), lambda d: None, arm="right") if JUDGE else None
+        if vis is not None: vis.peek = lambda: cam.latest("right_wrist")       # servo uses the newest frame, never waits
         def assist_left(plan_r):
             if not allow_assist or "left" not in arms or spot is None:
                 return False

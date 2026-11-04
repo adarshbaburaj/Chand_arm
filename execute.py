@@ -7,6 +7,7 @@ kept between moves, so there are no correction jumps at the end.
 import time
 import numpy as np
 import viz
+import tune          # live-tunable gains/speeds (tune.py slider window -> tune.json)
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 J = [f"{j}.pos" for j in JOINTS]
@@ -88,7 +89,8 @@ class Mover:
         grip = self.grip if grip is None else grip
         q_from, q_to = self.q.copy(), np.asarray(q_to, float)
         d = np.abs(q_to - q_from).max()
-        T = max(0.6, 1.875 * d / PEAK_DEG_S)          # min-jerk peak speed = 1.875 * d / T
+        T = max(tune.get("min_move_s"), 1.875 * d / tune.get("peak_deg_s"))   # min-jerk peak speed = 1.875 * d / T
+        KI = tune.get("sag_ki")
         n = int(T * HZ)
         t_next = time.perf_counter()
         for i in range(1, n + 1):
@@ -115,17 +117,20 @@ class Mover:
         self.q, self.grip = q_to, grip
         return e
 
-    def follow(self, path, grip=None, peak_deg_s=PEAK_DEG_S):
+    def follow(self, path, grip=None, peak_deg_s=None):
         """Stream a joint path (N x 5) without stopping at each waypoint: constant speed along the path,
         eased in/out over the whole length, same integral sag bias as move()."""
         grip = self.grip if grip is None else grip
+        # explicit slow speeds (approach/lift lines, 12-25 deg/s) scale with the live 'descend_deg_s' (default 25)
+        peak_deg_s = tune.get("peak_deg_s") if peak_deg_s is None else peak_deg_s * tune.get("descend_deg_s") / 25.0
+        KI = tune.get("sag_ki")
         P = np.vstack([self.q, np.asarray(path, float)])
         seg = np.abs(np.diff(P, axis=0)).max(axis=1)
         cum = np.r_[0, np.cumsum(seg)]
         L = cum[-1]
         if L < 0.5:
             return
-        T = max(0.8, 1.875 * L / peak_deg_s)
+        T = max(tune.get("min_move_s") + 0.2, 1.875 * L / peak_deg_s)
         n = int(T * HZ)
         t_next = time.perf_counter()
         for i in range(1, n + 1):
@@ -634,10 +639,12 @@ class Vision:
         return plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, dp),
                          tilt_min=plan.get("tilt_min", 0.0), dz=plan.get("dz", 0.0))
 
-    def servo(self, mv, plan, step, g_open, KP=0.6, KI=0.15, max_step_mm=4.0, max_total_mm=45.0, timeout=6.0):
-        """Visual servo into the capture zone: local red-blob tracking (~10 Hz) -> normalised image error -> PI ->
-        (radial, tangential) mm through the wrist-image jacobian -> small IK nudges at grasp height. Then Jev looks at
-        the frame with the zone drawn as a green box ("inside?"). Returns dict(plan, result, steps, total_mm, jev)."""
+    def servo(self, mv, plan, step, g_open, timeout=6.0, max_total_mm=45.0):
+        """Visual servo into the capture zone, smooth and live-tunable (tune.py):
+        the newest wrist frame (never waits for the camera) -> red-blob top-centre vs zone -> PID on the image error
+        (servo_kp/ki/kd) -> (radial, tangential) mm through the wrist-image jacobian, capped at servo_max_step_mm ->
+        IK -> one continuous nudge of servo_period_s, straight into the next one (no stop-and-go).
+        Then Jev referee on the frame with the zone drawn as a green box. Returns dict(plan, result, steps, total_mm, jev)."""
         import capture
         z = self.zone
         J = np.array(self.jac["J"]) if self.jac else np.array([[0.0, 0.0053], [0.009, 0.006]])
@@ -645,33 +652,41 @@ class Vision:
         az, axis = plan["az"], plan["axis"]
         ur, ut = np.array([np.cos(az), np.sin(az), 0.0]), np.array([-np.sin(az), np.cos(az), 0.0])
         tip0 = np.asarray(plan["tip"], float)
-        total, integ, ok_n, steps, last_b = np.zeros(2), np.zeros(2), 0, 0, None
-        t0, result = time.time(), "timeout"
+        total, integ, e_prev, ok_n, steps = np.zeros(2), np.zeros(2), None, 0, 0
+        t0, result, t_prev = time.time(), "timeout", time.time()
+        peek = getattr(self, "peek", None) or self.grab
         step("servo into the capture zone")
         while time.time() - t0 < timeout:
-            img = self.grab()
-            b = capture.track(img, z); last_b = b
+            img = peek()
+            b = capture.track(img, z) if img is not None else None
             if b is None:
                 result = "object not seen"; break
             e = capture.error(b, z)
+            now = time.time(); dt = max(0.03, now - t_prev); t_prev = now
+            de = np.zeros(2) if e_prev is None else (e - e_prev) / dt
+            e_prev = e
             viz.value(f"{self.arm}/servo/err_x_px", e[0] * capture.W); viz.value(f"{self.arm}/servo/err_y_px", e[1] * capture.H)
             if capture.inside(b, z):
                 ok_n += 1
                 if ok_n >= 2:
                     result = "inside"; break
-                continue
+                time.sleep(0.05); continue
             ok_n = 0
-            integ = np.clip(integ + e, -0.5, 0.5)
-            dp = -(KP * (Jinv @ e) + KI * (Jinv @ integ))                 # mm (radial, tangential)
-            n = np.linalg.norm(dp)
-            if n > max_step_mm: dp *= max_step_mm / n
+            kp, ki, kd = tune.get("servo_kp"), tune.get("servo_ki"), tune.get("servo_kd")
+            integ = np.clip(integ + e * dt, -0.3, 0.3)
+            u = kp * e + ki * integ + kd * 0.1 * de                        # PID on the normalised image error
+            dp = -(Jinv @ u)                                               # mm (radial, tangential)
+            cap = tune.get("servo_max_step_mm"); n = np.linalg.norm(dp)
+            if n > cap: dp *= cap / n
             if np.linalg.norm(total + dp) > max_total_mm:
                 result = "limit"; break
-            total += dp; steps += 1
-            q, err = kin.ik(tip0 + total[0] * ur + total[1] * ut, mv.q, down=False, axis=axis)
+            q, err = kin.ik(tip0 + (total + dp)[0] * ur + (total + dp)[1] * ut, mv.q, down=False, axis=axis)
             if err > 4:
-                total -= dp; result = "ik limit"; break
-            mv.nudge(q, T=0.12, grip=g_open)
+                result = "ik limit"; break
+            total += dp; steps += 1
+            viz.value(f"{self.arm}/servo/p", float(np.linalg.norm(kp * e))); viz.value(f"{self.arm}/servo/i", float(np.linalg.norm(ki * integ)))
+            viz.value(f"{self.arm}/servo/d", float(np.linalg.norm(kd * 0.1 * de)))
+            mv.nudge(q, T=tune.get("servo_period_s"), grip=g_open)          # continuous: next frame is taken right away
         # Jev referee on the frame with the zone drawn in
         jev = None
         try:

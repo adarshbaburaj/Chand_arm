@@ -5,3 +5,4 @@ snapshots/
 recordings/
 __pycache__/
 *.pyc
+tune.json
