@@ -93,9 +93,18 @@ class Mover:
             time.sleep(max(0.0, t_next - time.perf_counter()))
         self.q, self.grip = P[-1].copy(), grip
 
-    def gripper(self, value, wait=0.6):
-        self._send(self.q + self.bias, value)
-        time.sleep(wait)
+    def gripper(self, value, wait=0.6, deg_s=60.0):
+        """Ramp the gripper to `value` while holding the arm. A single command is not enough:
+        max_relative_target clips every command to 5 deg from the present position."""
+        start = float(self.f.get_observation()["gripper.pos"])
+        n = max(1, int(abs(value - start) / deg_s * HZ))
+        for i in range(1, n + 1):
+            self._send(self.q + self.bias, start + (value - start) * i / n)
+            time.sleep(1 / HZ)
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < wait:   # keep commanding: the clip re-applies each tick
+            self._send(self.q + self.bias, value)
+            time.sleep(1 / HZ)
         self.grip = value
         return float(self.f.get_observation()["gripper.pos"])
 
