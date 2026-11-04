@@ -30,7 +30,7 @@ if "--offline" in ARGS:
     socket.socket.connect = _guard
 
 import cv2
-import kin, perceive, brain, execute, judge, cams, viz, two_arm, assist, cost
+import kin, perceive, brain, execute, judge, cams, viz, two_arm, assist, cost, autotune
 from execute import Mover
 
 FOLLOWER_PORT, ARM_ID = "/dev/ttyFollowerLeft", "thumbi_right"
@@ -138,7 +138,7 @@ def main():
     skill = json.load(open(HERE / "skill.json")); rule = skill["rule"]
     calib = perceive.load_calib()
     root = tk.Tk(); root.title("chand mission (two arms)")
-    lab = tk.Label(root, font=("Sans", 14), width=90, height=10, justify="left"); lab.pack()
+    lab = tk.Label(root, font=("Sans", 14), width=100, height=11, justify="left"); lab.pack()
     st = {"pause": True, "quit": False}
     def key(e):
         if e.char == " ": st["pause"] = not st["pause"]
@@ -186,7 +186,8 @@ def main():
             lines.append(f"{n.upper():5s}: {a['status']}")
         if info["t0"] is not None and time.time() - info.get("cost_t", 0) > 2:    # live AI cost of this run
             info["cost_t"] = time.time(); info["cost"] = cost.fmt(cost.since(info["t0"]))
-        lines += [f"brain: {info['brain']}", f"cost so far: {info.get('cost', '$0')}", extra, "SPACE pause   Q stop (arms go home)"]
+        lines += [f"brain: {info['brain']}", f"autotune: {info.get('autotune', 'watching')}", f"cost so far: {info.get('cost', '$0')}",
+                  extra, "SPACE pause   Q stop (arms go home)"]
         try:
             lab.configure(text="\n".join(lines)); root.update()
         except tk.TclError:
@@ -374,6 +375,8 @@ def main():
                 info["brain"] = f"spark error: {e}"
         threading.Thread(target=go, daemon=True).start()
 
+    tuner = autotune.AutoTuner(arms, use_spark=BACKEND == "meta_api" and "--no-autotune" not in ARGS, status=info)
+    tuner.start()
     # ------------------------------------------------------------------ dispatcher
     ui("SPACE to start")
     while st["pause"] and not st["quit"]:
@@ -433,6 +436,7 @@ def main():
             time.sleep(0.15)
     finally:
         st["quit"] = True
+        tuner.running = False
         for n, a in arms.items():
             if a["job"] is not None: a["job"].join(timeout=60)
         for n, a in arms.items():

@@ -49,7 +49,9 @@ def pushback(load, cur):
 
 class Mover:
     def __init__(self, follower, hold=None, name="right"):
+        import collections
         self.name = name
+        self.tele = collections.deque(maxlen=400)       # (t, q_measured, q_commanded) for the jitter / tracking metrics
         self.f = follower
         self.hold = hold                 # callable -> True while paused
         self.bias = np.zeros(5)          # carried between moves
@@ -71,7 +73,30 @@ class Mover:
         o = self._obs()
         q = np.array([o[k] for k in J])
         viz.joints(self.name, q_meas=q)
+        self.tele.append((time.time(), q, getattr(self, "q_cmd", q)))
         return q
+
+    def metrics(self, window=3.0):
+        """Smoothness numbers over the last `window` s of measured motion:
+        jitter_deg = RMS of measured joints minus their 5-sample moving average (high-frequency shake),
+        reversals = velocity sign flips per second on the joint that moves most (back-and-forth),
+        track_err_deg = RMS commanded - measured. None if too few samples (arm not moving)."""
+        now = time.time()
+        d = [x for x in list(self.tele) if now - x[0] <= window]
+        if len(d) < 15:
+            return None
+        t = np.array([x[0] for x in d]); qm = np.array([x[1] for x in d]); qc = np.array([x[2] for x in d])
+        k = 5
+        ma = np.array([qm[max(0, i - k // 2): i + k // 2 + 1].mean(0) for i in range(len(qm))])
+        jitter = float(np.sqrt(np.mean((qm - ma)[k:-k] ** 2))) if len(qm) > 2 * k + 1 else 0.0
+        v = np.diff(qm, axis=0)
+        j = int(np.argmax(np.abs(qm[-1] - qm[0]) + np.abs(v).sum(0)))
+        vj = v[:, j][np.abs(v[:, j]) > 0.15]
+        rev = float(np.sum(np.diff(np.sign(vj)) != 0) / max(0.5, t[-1] - t[0])) if len(vj) > 2 else 0.0
+        trk = float(np.sqrt(np.mean((qc - qm) ** 2)))
+        moving = float(np.abs(v).sum(0).max())
+        return {"jitter_deg": round(jitter, 3), "reversals_per_s": round(rev, 2), "track_err_deg": round(trk, 2),
+                "moved_deg": round(moving, 1), "samples": len(d)}
 
     def _send(self, q, grip):
         self.q_cmd = np.asarray(q, float) - self.bias       # live commanded pose (other threads read it)
@@ -550,6 +575,9 @@ JOG_MM = 15.0
 MAX_SHIFT_MM = 25.0
 
 
+SERVO_LOG = []     # one entry per servo run: arm, result, steps, mm moved, error sign flips (oscillation), gains used
+
+
 class Vision:
     calib_failed = {}          # per arm: the wrist-camera jacobian self-calibration failed once -> don't retry
     """Image Jacobian between the tip's (radial, tangential) motion in mm and the red object's box centre in the
@@ -653,6 +681,7 @@ class Vision:
         ur, ut = np.array([np.cos(az), np.sin(az), 0.0]), np.array([-np.sin(az), np.cos(az), 0.0])
         tip0 = np.asarray(plan["tip"], float)
         total, integ, e_prev, ok_n, steps = np.zeros(2), np.zeros(2), None, 0, 0
+        flips, sign_prev, errs = 0, None, []
         t0, result, t_prev = time.time(), "timeout", time.time()
         peek = getattr(self, "peek", None) or self.grab
         step("servo into the capture zone")
@@ -665,6 +694,9 @@ class Vision:
             now = time.time(); dt = max(0.03, now - t_prev); t_prev = now
             de = np.zeros(2) if e_prev is None else (e - e_prev) / dt
             e_prev = e
+            sg = np.sign(e); errs.append(float(np.hypot(e[0] * capture.W, e[1] * capture.H)))
+            if sign_prev is not None: flips += int(np.sum((sg != sign_prev) & (sg != 0) & (sign_prev != 0)))
+            sign_prev = sg
             viz.value(f"{self.arm}/servo/err_x_px", e[0] * capture.W); viz.value(f"{self.arm}/servo/err_y_px", e[1] * capture.H)
             if capture.inside(b, z):
                 ok_n += 1
@@ -701,6 +733,10 @@ class Vision:
                                              "inside the thick green box."}}, boxed, "zone")["inside"]["noul"]
         except Exception as e:
             print("  zone check (Jev) failed:", e, flush=True)
+        SERVO_LOG.append({"t": time.time(), "arm": self.arm, "result": result, "steps": steps,
+                          "moved_mm": round(float(np.linalg.norm(total)), 1), "err_sign_flips": flips,
+                          "err_px_start_end": [round(errs[0], 1), round(errs[-1], 1)] if errs else None,
+                          "gains": {k: tune.get(k) for k in ("servo_kp", "servo_ki", "servo_kd", "servo_max_step_mm", "servo_period_s")}})
         print(f"  servo: {result} after {steps} nudges, moved {np.round(total, 1).tolist()} mm (radial, tangential), "
               f"jev inside {jev if jev is None else round(jev, 2)}", flush=True)
         viz.text(f"{self.arm} servo: {result}, {steps} nudges, {np.round(total, 1).tolist()} mm, jev {jev}")
