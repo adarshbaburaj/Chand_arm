@@ -317,7 +317,7 @@ def roll_across(seed, axis_px, calib):
     return float(best)
 
 
-def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
+def plan_pick(rock, skill, calib, shift=(0.0, 0.0), tilt_min=0.0, dz=0.0):
     """Joint targets for one rock, from the demo's grasp style:
     the demo's tip offset and tool tilt are expressed relative to the rock's direction from the base and
     rotated to the new rock. Seeded from the demo grasp joints so the arm uses the same posture."""
@@ -328,12 +328,12 @@ def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     d_az = np.arctan2(y, x) - np.arctan2(skill["picked"]["y_mm"], skill["picked"]["x_mm"])
     off = _rotz(skill["grasp"]["offset_from_rock_top_mm"], d_az)
     axis0 = _rotz(skill["grasp"]["tool_z"], d_az)
-    tip = np.array([x, y, calib["rock_top_z_mm"]]) + off
+    tip = np.array([x, y, calib["rock_top_z_mm"]]) + off + [0, 0, dz]      # dz > 0: grip the object higher
     seed = np.array(skill["grasp"]["q_deg"], float); seed[0] -= np.rad2deg(d_az)   # pan = -azimuth (checked with FK)
     if rock.get("shape") == "long" and rock.get("axis_px"):
         seed[4] = roll_across(seed, rock["axis_px"], calib)
     # demo tilt first; near the base that pins the elbow at its limit, so try steeper (more vertical) tilts
-    for blend in (0.0, 0.25, 0.5, 0.75):
+    for blend in [b for b in (0.0, 0.25, 0.5, 0.75) if b >= tilt_min - 1e-9]:   # tilt_min > 0: steeper attack
         axis = (1 - blend) * axis0 + blend * np.array([0, 0, -1.0]); axis /= np.linalg.norm(axis)
         q_grasp, e1 = kin.ik(tip, seed, down=False, axis=axis)
         # straight lines in space (joint interpolation near the base swings the tip in an arc):
@@ -361,10 +361,10 @@ def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     return dict(q_pre=q_pre, q_grasp=q_grasp, q_lift=q_lift, descend=descend, lift=lift, carry=carry, drop=drop, above_bin=above_bin,
                 tip=tip.round(1).tolist(), ik_err=round(err, 1), tilt_blend=blend, carry_min_z=round(float(min(tz)), 1),
                 pre_tip=(tip - APPROACH_MM * axis), axis=axis, az=float(np.arctan2(y, x)), shift=list(shift),
-                rock=rock, calib=calib)
+                rock=rock, calib=calib, tilt_min=tilt_min, dz=dz)
 
 
-MAX_GRASPS = 3
+MAX_GRASPS = 4
 
 
 def _add_shift(plan, dp):
@@ -411,13 +411,14 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
     #   grasp 2 fails -> back off a few cm and let the LEFT arm take the object to the handoff spot (assist);
     #                    the caller then picks it there. No assist possible -> grasp 3: full retreat, Jev says
     #                    which way (or a search pattern), widest jaws.
-    OPEN_STEPS = [g_open, 45.0, 58.0]        # gripper.pos 0-100 %
+    OPEN_STEPS = [g_open, 45.0, 58.0, 58.0]  # gripper.pos 0-100 %
     tang = [(0.0, 10.0), (0.0, -20.0)]
     out["grasps"] = []
     backed_off = False
 
-    def replan(p, dp):
-        return vis.replan(p, dp) if vis is not None else plan_pick(p["rock"], skill, p["calib"], shift=_add_shift(p, dp))
+    def replan(p, dp, **kw):
+        kw = {"tilt_min": p.get("tilt_min", 0.0), "dz": p.get("dz", 0.0), **kw}
+        return plan_pick(p["rock"], skill, p["calib"], shift=_add_shift(p, dp), **kw)
 
     for k in range(MAX_GRASPS):
         step(f"close {k + 1} (force feedback)")
@@ -444,7 +445,7 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
             mv.move(plan["q_pre"], grip=g_open)
             mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=0.8)
             continue
-        # k == 1: two misses. Back off a few cm so the left arm has room, and ask it to help.
+        # k >= 1: Jev says which way the object is (photo at grasp height); k == 1 also backs off for the left arm
         dp = tang[0]
         if vis is not None:            # which way is the object? (photo taken at grasp height, before backing off)
             w = vis.where()
@@ -453,19 +454,32 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
                 dp = (12.0, 0.0)
             elif w.get("choice") in ("left", "right"):
                 dp = tang[1] if w.get("choice") == "right" else tang[0]
-        step("backing off for the left arm"); _retreat(mv, plan); backed_off = True
-        T = kin.fk(mv.q); q_up, e = kin.ik(T[:3, 3] + [0, 0, 40.0], mv.q, down=False, axis=T[:3, 2])
-        if e < 5:
-            mv.move(q_up, settle_s=0.2)                   # ~6 cm back along the approach + 4 cm up
-        out["standby_q"] = mv.q.copy()
-        if assist is not None:
-            step("waiting: LEFT arm takes the object to the handoff spot")
-            if assist(plan):
-                out.update(held=False, grip=ff["pos"], reason="assisted", shift_rt=[0.0, 0.0])
-                return out                                # caller picks it at the handoff spot from here
-        # no assist: third grasp, widest jaws, full re-approach
-        step(f"grasp 3: jaws {g_open:.0f} %, re-aim {dp}")
-        plan = replan(plan, dp)
+        _retreat(mv, plan)
+        if k == 1:
+            # two misses: back off a few cm so the left arm has room, and ask it to help
+            step("backing off for the left arm"); backed_off = True
+            T = kin.fk(mv.q); q_up, e = kin.ik(T[:3, 3] + [0, 0, 40.0], mv.q, down=False, axis=T[:3, 2])
+            if e < 5:
+                mv.move(q_up, settle_s=0.2)               # ~6 cm back along the approach + 4 cm up
+            out["standby_q"] = mv.q.copy()
+            if assist is not None:
+                step("waiting: LEFT arm takes the object to the handoff spot")
+                if assist(plan):
+                    out.update(held=False, grip=ff["pos"], reason="assisted", shift_rt=[0.0, 0.0])
+                    return out                            # caller picks it at the handoff spot from here
+            # grasp 3: CHANGE THE ANGLE OF ATTACK (steeper, more from above) and grip 8 mm higher, widest jaws
+            try:
+                new = replan(plan, (0.0, 0.0), tilt_min=max(0.5, plan.get("tilt_blend", 0.0) + 0.25), dz=8.0)
+                step(f"grasp 3: new angle (tilt {new['tilt_blend']}), 8 mm higher, jaws {g_open:.0f} %")
+                print(f"  grasp 3: steeper angle of attack (tilt blend {new['tilt_blend']}), 8 mm higher, jaws {g_open:.0f} %", flush=True)
+                plan = new
+            except ValueError as e:
+                print(f"  grasp 3: no steeper approach here ({e}) -> re-aim {dp}", flush=True)
+                plan = replan(plan, dp)
+        else:
+            # grasp 4: normal angle again, re-aim the way Jev saw the object
+            step(f"grasp 4: re-aim {dp}, jaws {g_open:.0f} %")
+            plan = replan(plan, dp, tilt_min=0.0, dz=0.0)
         mv.move(plan["q_pre"], grip=g_open)
         mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=0.8)
     gm = ff["pos"]
@@ -590,7 +604,8 @@ class Vision:
         return d
 
     def replan(self, plan, dp):
-        return plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, dp))
+        return plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, dp),
+                         tilt_min=plan.get("tilt_min", 0.0), dz=plan.get("dz", 0.0))
 
     def where(self):
         img = self.grab()

@@ -121,7 +121,8 @@ def plan_next(rule, rocks, history):
 import threading  # noqa: E402
 
 IDLE_REST_S = 5.0
-LEFT_EXTRA_DEPTH_MM = 10.0
+LEFT_EXTRA_DEPTH_MM = 18.0   # run 12: Jev said "beyond" on every left miss
+HOME_WATCH_WRIST_FLEX = 20.0      # deg: wrist camera looks out over the table (tool axis ~13° below horizontal)
 CARRY_IGNORE_PX = 80
 _order_lock = threading.Lock()
 
@@ -164,6 +165,11 @@ def main():
     for a in arms.values():
         a.update(job=None, status="idle (rest)", at_rest=True, lock=threading.Lock())
     spot = two_arm.handoff_spot(skill) if "left" in arms else None
+    # right arm "home" between picks (user, 03:55): shoulder/elbow/pan at rest, but the wrist NOT folded back and the
+    # roll not turned back, so the wrist camera keeps looking out over the taped work area.
+    home_watch = arms["right"]["rest"].copy()
+    home_watch[3] = HOME_WATCH_WRIST_FLEX
+    home_watch[4] = execute.bin_drop_q(skill)[4]
     mR, mL = two_arm.mask("right"), two_arm.mask("left")
     overlap = (mR > 0) & (mL > 0) if mR is not None and mL is not None else None
     ZONE = threading.Lock()
@@ -267,7 +273,7 @@ def main():
             plan = execute.plan_pick(rock, skill, calib, shift=execute.rt_to_world(rt, np.arctan2(rock["y_mm"], rock["x_mm"])))
         except ValueError as e:
             blacklist.append((rock["x_mm"], rock["y_mm"])); record("right", rock, f"cannot plan: {e}"); return
-        scan_pose = plan["above_bin"]
+        scan_pose = home_watch            # after the drop: body to rest, wrist kept up so the wrist camera watches the table
         in_zone = overlap is not None and overlap[min(479, max(0, int(rock["v"]))), min(639, max(0, int(rock["u"])))]
         zone_held = {"yes": False}
         def step(name):
@@ -324,7 +330,7 @@ def main():
         record("left", rock, "handed to the right arm" if res.get("held") else ("left: " + (res.get("reason") or "missed grasp")), res)
 
     def go_rest(arm):
-        arms[arm]["mv"].move(arms[arm]["rest"]); arms[arm]["at_rest"] = True
+        arms[arm]["mv"].move(home_watch if arm == "right" else arms[arm]["rest"]); arms[arm]["at_rest"] = True
 
     def run_job(arm, name, fn, *a):
         def wrap():
@@ -346,7 +352,7 @@ def main():
                     import traceback; traceback.print_exc()
                     print(f"  [{arm}] job error: {e}", flush=True)
                 finally:
-                    arms[arm]["status"] = "idle (rest)" if arms[arm]["at_rest"] else "idle (scanning above the bin)" if arm == "right" else "idle"
+                    arms[arm]["status"] = "idle (rest)" if arms[arm]["at_rest"] else "idle (home, wrist camera watching)" if arm == "right" else "idle"
                     arms[arm]["job"] = None
         if arm == "right" and name != "rest": arms[arm]["at_rest"] = False
         if arm == "left": arms[arm]["at_rest"] = name == "rest"
