@@ -196,6 +196,19 @@ class Mover:
         if log is not None: log.append(res)
         return res
 
+    def nudge(self, q_to, T=0.15, grip=None):
+        """Small smooth correction for visual servoing: straight joint interpolation over T s at 50 Hz (keeps the
+        sag bias), no settle. Many nudges in a row = smooth continuous motion."""
+        grip = self.grip if grip is None else grip
+        q_from, q_to = self.q.copy(), np.asarray(q_to, float)
+        n = max(2, int(T * HZ))
+        for i in range(1, n + 1):
+            while self.hold and self.hold():
+                time.sleep(0.05)
+            self._send(q_from + (q_to - q_from) * (i / n) + self.bias, grip)
+            time.sleep(1 / HZ)
+        self.q, self.grip = q_to, grip
+
     def gripper(self, value, wait=0.6, deg_s=60.0):
         """Ramp the gripper to `value` while holding the arm. A single command is not enough:
         max_relative_target clips every command to 5 deg from the present position."""
@@ -390,7 +403,11 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
     # (the wrist-camera jacobian self-calibration is no longer needed: depth/side come from Jev's 'where' choice)
     step("descend");  mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
-    if vis is not None:
+    servo_info = vis.servo(mv, plan, step, g_open) if vis is not None and vis.zone is not None else None
+    if servo_info is not None:
+        out["servo"] = {k: v for k, v in servo_info.items() if k != "plan"}
+        plan = servo_info["plan"]
+    if vis is not None and servo_info is None:
         # look before closing (wrist camera, Jev choice): object BEYOND the fingertips -> slide 15 mm deeper in place,
         # off to one side -> slide 10 mm sideways; up to 3 corrections. (run 13: left arm closed on air with the
         # object a full width beyond the tips.) Good grasps score 'beyond' ~0.6, real misses 0.84-0.97.
@@ -540,6 +557,8 @@ class Vision:
         self.arm = arm
         self.jac_file = JAC_FILE.with_name(f"wrist_jac_{arm}.json")      # each arm has its OWN camera calibration
         self.jac = _json.loads(self.jac_file.read_text()) if self.jac_file.exists() else None
+        import capture
+        self.zone = capture.zone(arm)                                   # taught capture zone (capture.py), or None
 
     def _look(self, tag):
         img = self.grab()
@@ -614,6 +633,67 @@ class Vision:
     def replan(self, plan, dp):
         return plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, dp),
                          tilt_min=plan.get("tilt_min", 0.0), dz=plan.get("dz", 0.0))
+
+    def servo(self, mv, plan, step, g_open, KP=0.6, KI=0.15, max_step_mm=4.0, max_total_mm=45.0, timeout=6.0):
+        """Visual servo into the capture zone: local red-blob tracking (~10 Hz) -> normalised image error -> PI ->
+        (radial, tangential) mm through the wrist-image jacobian -> small IK nudges at grasp height. Then Jev looks at
+        the frame with the zone drawn as a green box ("inside?"). Returns dict(plan, result, steps, total_mm, jev)."""
+        import capture
+        z = self.zone
+        J = np.array(self.jac["J"]) if self.jac else np.array([[0.0, 0.0053], [0.009, 0.006]])
+        Jinv = np.linalg.pinv(J)
+        az, axis = plan["az"], plan["axis"]
+        ur, ut = np.array([np.cos(az), np.sin(az), 0.0]), np.array([-np.sin(az), np.cos(az), 0.0])
+        tip0 = np.asarray(plan["tip"], float)
+        total, integ, ok_n, steps, last_b = np.zeros(2), np.zeros(2), 0, 0, None
+        t0, result = time.time(), "timeout"
+        step("servo into the capture zone")
+        while time.time() - t0 < timeout:
+            img = self.grab()
+            b = capture.track(img, z); last_b = b
+            if b is None:
+                result = "object not seen"; break
+            e = capture.error(b, z)
+            viz.value(f"{self.arm}/servo/err_x_px", e[0] * capture.W); viz.value(f"{self.arm}/servo/err_y_px", e[1] * capture.H)
+            if capture.inside(b, z):
+                ok_n += 1
+                if ok_n >= 2:
+                    result = "inside"; break
+                continue
+            ok_n = 0
+            integ = np.clip(integ + e, -0.5, 0.5)
+            dp = -(KP * (Jinv @ e) + KI * (Jinv @ integ))                 # mm (radial, tangential)
+            n = np.linalg.norm(dp)
+            if n > max_step_mm: dp *= max_step_mm / n
+            if np.linalg.norm(total + dp) > max_total_mm:
+                result = "limit"; break
+            total += dp; steps += 1
+            q, err = kin.ik(tip0 + total[0] * ur + total[1] * ut, mv.q, down=False, axis=axis)
+            if err > 4:
+                total -= dp; result = "ik limit"; break
+            mv.nudge(q, T=0.12, grip=g_open)
+        # Jev referee on the frame with the zone drawn in
+        jev = None
+        try:
+            img = self.grab()
+            boxed = capture.draw(img, z, capture.track(img, z))
+            cv2_ok = True
+            import cv2
+            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime(f"servo_{self.arm}_%H%M%S.jpg")), boxed)
+            viz.image(f"ai/{self.arm}_capture_zone", boxed)
+            jev = self.judge.ask("Wrist camera of an open robot gripper. A green box is drawn on the image: IMG1",
+                                 {"inside": {"type": "noul", "instructions": "The middle of the top edge of the red object is "
+                                             "inside the thick green box."}}, boxed, "zone")["inside"]["noul"]
+        except Exception as e:
+            print("  zone check (Jev) failed:", e, flush=True)
+        print(f"  servo: {result} after {steps} nudges, moved {np.round(total, 1).tolist()} mm (radial, tangential), "
+              f"jev inside {jev if jev is None else round(jev, 2)}", flush=True)
+        viz.text(f"{self.arm} servo: {result}, {steps} nudges, {np.round(total, 1).tolist()} mm, jev {jev}")
+        new = plan_pick(self.rock, self.skill, self.calib, shift=_add_shift(plan, tuple(total)),
+                        tilt_min=plan.get("tilt_min", 0.0), dz=plan.get("dz", 0.0)) if np.linalg.norm(total) > 0.5 else plan
+        if new is not plan:
+            mv.move(new["q_grasp"], grip=g_open, settle_s=0.4)             # lines for the lift are re-planned at the new spot
+        return {"plan": new, "result": result, "steps": steps, "total_mm": np.round(total, 1).tolist(), "jev": jev}
 
     def where(self):
         img = self.grab()
