@@ -66,6 +66,8 @@ def plan_next(rule, rocks, history):
             if r is not None:
                 return {"skill": "pick", "obj": r["id"], "why": "next in Spark's plan"}, "plan (cached)"
             _ORDER.pop(0)                                   # already mined or moved: drop it
+    if len(allowed) == 1:                                    # nothing to decide: skip the 5-9 s Spark call
+        return {"skill": "pick", "obj": allowed[0], "why": "only one target left"}, "rule (single)"
     if BACKEND == "rule":
         r = min((r for r in rocks if r["id"] in allowed), key=lambda r: np.hypot(r["x_mm"], r["y_mm"]))
         return {"skill": "pick", "obj": r["id"], "why": "nearest first"}, "rule"
