@@ -242,7 +242,16 @@ def memory_get(shape):
     return DEFAULT_RT.get(shape, DEFAULT_RT["_other"]), "default"
 
 
+import threading as _threading  # noqa: E402
+_mem_lock = _threading.Lock()
+
+
 def memory_put(shape, rt, ok):
+    with _mem_lock:
+        _memory_put(shape, rt, ok)
+
+
+def _memory_put(shape, rt, ok):
     """Successful offsets pull the memory toward them (EMA 0.5); failures are only counted."""
     import json
     m = json.loads(_mem_path().read_text()) if _mem_path().exists() else {}
@@ -271,6 +280,23 @@ def bin_drop_q(skill):
     return np.array(json.loads(f.read_text())["q_deg"] if f.exists() else skill["drop_q_deg"], float)
 
 
+def roll_across(seed, axis_px, calib):
+    """Wrist roll that makes the jaws close ACROSS a long object (not along it). In gripper_frame_link the jaw hinge
+    is the y axis (URDF: gripper joint axis z, rpy 90° about x, frame flipped 180° about y), so the jaws close along
+    the frame's x axis: choose the roll that makes x perpendicular to the object's long axis, nearest the demo roll."""
+    A2 = np.asarray(calib["A_px_to_mm"], float)[:, :2]
+    L = A2 @ np.asarray(axis_px, float); L /= np.linalg.norm(L)
+    lo, hi = np.rad2deg(kin.LIMITS["wrist_roll"]) if "wrist_roll" in kin.LIMITS else (-150, 150)
+    best, best_cost = seed[4], 9.0
+    for roll in np.arange(max(lo + 5, -150), min(hi - 5, 150), 5.0):
+        q = seed.copy(); q[4] = roll
+        x = kin.fk(q)[:3, 0]; xy = x[:2] / max(1e-6, np.linalg.norm(x[:2]))
+        cost = abs(float(xy @ L)) + 0.002 * abs(roll - seed[4])        # across the long axis, small wrist turn
+        if cost < best_cost:
+            best, best_cost = roll, cost
+    return float(best)
+
+
 def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     """Joint targets for one rock, from the demo's grasp style:
     the demo's tip offset and tool tilt are expressed relative to the rock's direction from the base and
@@ -284,6 +310,8 @@ def plan_pick(rock, skill, calib, shift=(0.0, 0.0)):
     axis0 = _rotz(skill["grasp"]["tool_z"], d_az)
     tip = np.array([x, y, calib["rock_top_z_mm"]]) + off
     seed = np.array(skill["grasp"]["q_deg"], float); seed[0] -= np.rad2deg(d_az)   # pan = -azimuth (checked with FK)
+    if rock.get("shape") == "long" and rock.get("axis_px"):
+        seed[4] = roll_across(seed, rock["axis_px"], calib)
     # demo tilt first; near the base that pins the elbow at its limit, so try steeper (more vertical) tilts
     for blend in (0.0, 0.25, 0.5, 0.75):
         axis = (1 - blend) * axis0 + blend * np.array([0, 0, -1.0]); axis /= np.linalg.norm(axis)
@@ -338,9 +366,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
     home = mv.q.copy() if end_pose is None else np.asarray(end_pose, float)   # where to finish (rest or scan pose)
     out = {"aim": []}
     step("approach"); mv.move(plan["q_pre"], grip=g_open)
-    if vis is not None and vis.jac is None and not Vision.calib_failed:
-        step("calibrate wrist cam"); vis.calibrate(mv, plan)
-        Vision.calib_failed = vis.jac is None     # don't waste ~6 s per pick retrying
+    if vis is not None and vis.jac is None and not Vision.calib_failed.get(vis.arm):
+        step("calibrate wrist cam (first time only)"); vis.calibrate(mv, plan)
+        Vision.calib_failed[vis.arm] = vis.jac is None     # don't waste ~6 s per pick retrying
     step("descend");  mv.follow(plan["descend"][1:], grip=g_open, peak_deg_s=25); mv.move(plan["q_grasp"], grip=g_open, settle_s=1.2)
     if vis is not None:
         for k in range(3):
@@ -361,8 +389,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
     # ---- force-feedback grasp with regrasp search: close until the jaw feels the object; if it closes on air,
     # reopen, back straight up, shift the aim (camera-guided if possible, else a small search pattern), try again
     # run 6: wrist cam showed the object just BEYOND the fingertips (arm stopped short) -> search deeper first
-    pattern = [(12.0, 0.0), (12.0, 0.0), (-24.0, 8.0), (0.0, -16.0)]   # (radial, tangential) mm, cumulative shifts
-    tang = [(0.0, 8.0), (0.0, -16.0)]
+    pattern = [(15.0, 0.0), (15.0, 0.0), (-30.0, 10.0), (0.0, -20.0)]   # (radial, tangential) mm, cumulative shifts
+    tang = [(0.0, 10.0), (0.0, -20.0)]
+    OPEN_STEPS = [g_open, 45.0, 58.0]        # each retry opens the jaws wider (gripper.pos 0-100 %)
     out["grasps"] = []
     for k in range(MAX_GRASPS):
         step("close (force feedback)")
@@ -373,7 +402,9 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
         print(f"  grasp {k + 1}: contact {ff['contact']} pos {ff['pos']} load {ff['load']} -> {'FEELS OBJECT' if ff['held'] else 'closed on air'}", flush=True)
         if ff["held"] or k == MAX_GRASPS - 1:
             break
-        step("regrasp"); mv.gripper(g_open, wait=0.3)
+        g_open = OPEN_STEPS[min(k + 1, len(OPEN_STEPS) - 1)]
+        step(f"regrasp {k + 2}: deeper + jaws wider ({g_open:.0f} %)"); mv.gripper(g_open, wait=0.3)
+        print(f"  regrasp {k + 2}: opening jaws to {g_open:.0f} %, going deeper", flush=True)
         if assist is not None and not out.get("assisted"):
             # two-arm: right gripper stays open at the grasp pose, the left arm slides the object into the jaws
             step("left arm push"); out["assisted"] = bool(assist(plan))
@@ -434,21 +465,23 @@ MAX_SHIFT_MM = 25.0
 
 
 class Vision:
-    calib_failed = False
+    calib_failed = {}          # per arm: the wrist-camera jacobian self-calibration failed once -> don't retry
     """Image Jacobian between the tip's (radial, tangential) motion in mm and the red object's box centre in the
     wrist image. Measured once by two small jogs at the approach pose (self-calibration), saved to wrist_jac.json,
     scaled by the box width at grasp time (closer = bigger = more pixels per mm)."""
 
-    def __init__(self, skill, calib, rock, grab, on_look=lambda d: None):
+    def __init__(self, skill, calib, rock, grab, on_look=lambda d: None, arm="right"):
         import judge
         self.judge, self.skill, self.calib, self.rock, self.grab, self.on_look = judge, skill, calib, rock, grab, on_look
-        self.jac = _json.loads(JAC_FILE.read_text()) if JAC_FILE.exists() else None
+        self.arm = arm
+        self.jac_file = JAC_FILE.with_name(f"wrist_jac_{arm}.json")      # each arm has its OWN camera calibration
+        self.jac = _json.loads(self.jac_file.read_text()) if self.jac_file.exists() else None
 
     def _look(self, tag):
         img = self.grab()
         try:
             import cv2
-            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime(f"wrist_%H%M%S_{tag}.jpg")), img)
+            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime(f"wrist_{self.arm}_%H%M%S_{tag}.jpg")), img)
         except Exception:
             pass
         d = self.judge.wrist_look(img, tag)
@@ -487,7 +520,7 @@ class Vision:
         if abs(np.linalg.det(J)) < 1e-5:
             print("  wrist calibration: degenerate jacobian", np.round(J, 4), flush=True); return
         self.jac = {"J": J.tolist(), "w_ref": b0["w"]}
-        JAC_FILE.write_text(_json.dumps(self.jac, indent=1))
+        self.jac_file.write_text(_json.dumps(self.jac, indent=1))
         print(f"  wrist jacobian (img/mm) {np.round(J, 4).tolist()}  box w {b0['w']:.2f}", flush=True)
 
     def aim(self, at_pre=False):
@@ -521,7 +554,7 @@ class Vision:
         img = self.grab()
         try:
             import cv2
-            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime("wrist_%H%M%S_where.jpg")), img)
+            cv2.imwrite(str(_Path(__file__).with_name("snapshots") / time.strftime(f"wrist_{self.arm}_%H%M%S_where.jpg")), img)
             w = self.judge.where(img)
         except Exception as e:
             print("  where check failed:", e, flush=True); return {"choice": None, "p": {}}

@@ -97,8 +97,9 @@ WHERE_Q = {"where": {"type": "choice", "instructions": "Wrist camera of an open 
 def where(img, tag="where"):
     """After a grasp closed on air: which way is the object? (choice + probabilities). Biased toward 'beyond'
     (even good grasps score ~0.6 beyond), so callers compare against the miss pattern, not argmax alone."""
-    a = ask("Wrist camera image: IMG1", WHERE_Q, img, tag)["where"]
-    out = {"choice": a.get("choice"), "p": a.get("probabilities") or {}, "s": a["_s"]}
+    ans = ask("Wrist camera image: IMG1", WHERE_Q, img, tag)
+    a = ans["where"]
+    out = {"choice": a.get("choice"), "p": a.get("probabilities") or {}, "s": ans["_s"]}
     last["where"] = out
     return out
 

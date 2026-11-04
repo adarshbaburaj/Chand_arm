@@ -72,8 +72,10 @@ def detect(img):
             continue
         if not in_work_area(cx, cy):          # outside the black lines: not our job
             continue
+        a_long = np.deg2rad(ang if w >= h else ang + 90.0)          # direction of the object's long side (px)
         objs.append({"id": f"red_{len(objs)}", "colour": "red", "u": round(cx), "v": round(cy),
-                     "angle_deg": round(ang, 1), "size_px": round(max(w, h)), "contour": c, "shape": shape_of(c, w, h)})
+                     "angle_deg": round(ang, 1), "size_px": round(max(w, h)), "contour": c, "shape": shape_of(c, w, h),
+                     "axis_px": [round(float(np.cos(a_long)), 3), round(float(np.sin(a_long)), 3)]})
     return objs, bin_box
 
 
@@ -114,7 +116,7 @@ def scene(img, calib):
     for o in objs:
         x, y = to_mm(o["u"], o["v"], calib)
         out.append({"id": o["id"], "colour": o["colour"], "x_mm": round(x), "y_mm": round(y),
-                    "angle_deg": o["angle_deg"], "u": o["u"], "v": o["v"], "shape": o["shape"]})
+                    "angle_deg": o["angle_deg"], "u": o["u"], "v": o["v"], "shape": o["shape"], "axis_px": o["axis_px"]})
     b = None
     if bin_box:
         bx, by, bw, bh = bin_box

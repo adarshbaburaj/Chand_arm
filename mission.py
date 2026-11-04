@@ -242,7 +242,7 @@ def main():
             if name in ("carry", "home") and zone_held["yes"]:
                 ZONE.release(); zone_held["yes"] = False
             _s(name)
-        vis = execute.Vision(skill, calib, rock, lambda: cam.fresh("right_wrist"), lambda d: None) if JUDGE else None
+        vis = execute.Vision(skill, calib, rock, lambda: cam.fresh("right_wrist"), lambda d: None, arm="right") if JUDGE else None
         def push(plan_r):
             if "left" not in arms or not arms["left"]["lock"].acquire(blocking=False):
                 return False                                 # left arm busy: no assist this time
@@ -272,15 +272,16 @@ def main():
         mv = arms["left"]["mv"]; step = make_step("left")
         rt, _ = execute.memory_get(rock.get("shape", "_other"))
         xL, yL = two_arm.px_to_arm("left", rock["u"], rock["v"])
-        vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL}, lambda: cam.fresh("left_wrist"), lambda d: None)
-               if JUDGE and "left_wrist" in cam.cams else None)
+        extra = {"shape": rock.get("shape"), "axis_px": rock.get("axis_px")}
+        vis = (execute.Vision(skill, two_arm.calib("left"), {"x_mm": xL, "y_mm": yL, **extra}, lambda: cam.fresh("left_wrist"),
+                              lambda d: None, arm="left") if JUDGE and "left_wrist" in cam.cams else None)
         def spot_free():
             f = cam.fresh("top"); objs, _ = perceive.detect(f)
             return not any(np.hypot(o["u"] - spot[0], o["v"] - spot[1]) < 40 for o in objs)
         held_zone = {}
         try:
             res = two_arm.left_handoff(mv, (rock["u"], rock["v"]), skill, spot, step, vis=vis, shift_rt=rt,
-                                       zone=ZONE, spot_free=spot_free, held_zone=held_zone)
+                                       zone=ZONE, spot_free=spot_free, held_zone=held_zone, extra=extra)
         except ValueError as e:
             res = {"held": False, "reason": f"cannot plan: {e}"}
         finally:

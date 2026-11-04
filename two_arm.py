@@ -82,7 +82,7 @@ def handoff_spot(skill):
 
 
 def left_handoff(mv_left, rock_px, skill, spot_px, step=lambda n: None, vis=None, shift_rt=(0.0, 0.0), zone=None, spot_free=None,
-                 held_zone=None):
+                 held_zone=None, extra=None):
     """zone: threading.Lock for the shared area; acquired before entering it, released by the caller after the left arm
     is home (held_zone['yes'] tells the caller it holds it)."""
     held_zone = {} if held_zone is None else held_zone
@@ -90,7 +90,7 @@ def left_handoff(mv_left, rock_px, skill, spot_px, step=lambda n: None, vis=None
     to spot_px and put it down gently with the same grasp pose, open, back off, go home."""
     cl = calib("left")
     x, y = px_to_arm("left", *rock_px)
-    plan = execute.plan_pick({"x_mm": x, "y_mm": y}, skill, cl, shift=execute.rt_to_world(shift_rt, np.arctan2(y, x)))
+    plan = execute.plan_pick({"x_mm": x, "y_mm": y, **(extra or {})}, skill, cl, shift=execute.rt_to_world(shift_rt, np.arctan2(y, x)))
     sx, sy = px_to_arm("left", *spot_px)
     put = execute.plan_pick({"x_mm": sx, "y_mm": sy}, skill, cl)        # same grasp pose, at the spot
 
