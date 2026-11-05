@@ -17,9 +17,9 @@ PARAMS = [("servo_kp",             0.6,  0.0,   1.5,   0.05, "servo P: how hard 
           ("servo_kd",             0.10, 0.0,   0.6,   0.01, "servo D: damps oscillation"),
           ("servo_max_step_mm",    4.0,  1.0,   8.0,   0.5,  "servo: largest single correction (mm)"),
           ("servo_period_s",       0.10, 0.05,  0.30,  0.01, "servo: time per correction (longer = softer)"),
-          ("peak_deg_s",           34.0, 15.0,  60.0,  1.0,  "big moves: peak joint speed (deg/s)"),
+          ("peak_deg_s",           40.0, 15.0,  60.0,  1.0,  "big moves: peak joint speed (deg/s)"),
           ("descend_deg_s",        25.0, 8.0,   40.0,  1.0,  "approach/lift lines: speed (deg/s)"),
-          ("min_move_s",           0.8,  0.4,   2.0,   0.05, "shortest time for any move (longer = softer starts/stops)"),
+          ("min_move_s",           0.6,  0.4,   2.0,   0.05, "shortest time for any move (longer = softer starts/stops)"),
           ("sag_ki",               0.04, 0.0,   0.08,  0.005, "gravity-sag integral gain (lower = softer, more sag)")]
 DEFAULTS = {p[0]: p[1] for p in PARAMS}
 RANGES = {p[0]: (p[2], p[3]) for p in PARAMS}

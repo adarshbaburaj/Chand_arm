@@ -375,8 +375,10 @@ def main():
                 info["brain"] = f"spark error: {e}"
         threading.Thread(target=go, daemon=True).start()
 
-    tuner = autotune.AutoTuner(arms, use_spark=BACKEND == "meta_api" and "--no-autotune" not in ARGS, status=info)
-    tuner.start()
+    # auto-tuning (Spark + jitter smoothing) is OFF by default (user, 05:05: keep it simple and fast); --autotune turns it on
+    tuner = autotune.AutoTuner(arms, use_spark=BACKEND == "meta_api", status=info)
+    if "--autotune" in ARGS:
+        tuner.start()
     # ------------------------------------------------------------------ dispatcher
     ui("SPACE to start")
     while st["pause"] and not st["quit"]:

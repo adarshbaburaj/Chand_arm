@@ -493,15 +493,15 @@ def pick_place(mv, plan, skill, step=lambda name: None, vis=None, assist=None, p
                 return out
             mv.move(plan["q_pre"], grip=jaws)
             mv.follow(plan["descend"][1:], grip=jaws, peak_deg_s=25); mv.move(plan["q_grasp"], grip=jaws, settle_s=0.8)
-        # b) camera servo into the capture zone (only now), then close
-        if vis is not None and vis.zone is not None:
+        # b) camera servo into the capture zone (only now), then close   [hidden unless TROUBLESHOOT]
+        if TROUBLESHOOT and vis is not None and vis.zone is not None:
             sv = vis.servo(mv, plan, step, jaws)
             out["servo"] = {k: v for k, v in sv.items() if k != "plan"}
             plan = sv["plan"]
             if sv["result"] != "object not seen":
                 ff = close("4 camera servo")
-        # c) steeper angle of attack, grip 8 mm higher
-        if not ff["held"]:
+        # c) steeper angle of attack, grip 8 mm higher   [hidden unless TROUBLESHOOT]
+        if TROUBLESHOOT and not ff["held"]:
             try:
                 new = replan(plan, (0.0, 0.0), tilt_min=max(0.5, plan.get("tilt_blend", 0.0) + 0.25), dz=8.0)
                 mv.gripper(jaws, wait=0.25); reapproach(new, jaws)
@@ -546,6 +546,7 @@ JOG_MM = 15.0
 MAX_SHIFT_MM = 25.0
 
 
+TROUBLESHOOT = False   # camera servo + angle-of-attack retries after 3 misses: hidden for now (user, 05:05: keep it simple)
 SERVO_LOG = []     # one entry per servo run: arm, result, steps, mm moved, error sign flips (oscillation), gains used
 
 
